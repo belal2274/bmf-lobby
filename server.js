@@ -34,15 +34,22 @@ function resolve(room) {
   const disc = tally[st.imp] > 0 && tally[st.imp] === top && st.ids.filter(id => tally[id] === top).length === 1;
   const d = {};
   for (const id of st.ids) d[id] = 0;
-  for (const [voter, tgt] of st.votes) if (voter !== st.imp) d[voter] = tgt === st.imp ? 2 : -1;
-  const nonPick = st.ids.filter(id => id !== st.imp && st.votes.get(id) !== st.imp).length;
-  d[st.imp] = (st.ids.length < 5 && disc) ? -2 : disc ? -tally[st.imp] : (st.ids.length < 5 ? Math.max(0, IMP_MIN - tally[st.imp]) : nonPick);
+  const others = st.ids.length - 1;
+  let picks = 0;
+  for (const id of st.ids) {
+    if (id === st.imp) continue;
+    const tgt = st.votes.get(id);
+    if (!tgt) d[id] = -2; else if (tgt === st.imp) { d[id] = 2; picks++; } else d[id] = -1;
+  }
+  const nonPick = others - picks;
+  if (st.ids.length >= 5) d[st.imp] = nonPick - picks;
+  else d[st.imp] = (picks === others ? 0 : IMP_MIN) - picks;
   const tot = {};
   for (const id of st.ids) { room.scores[id] = (room.scores[id] || 0) + d[id]; tot[id] = room.scores[id]; }
   const votes = {}; for (const [a, b] of st.votes) votes[a] = b;
   let win = [];
   if (room.round >= room.rounds) { const mx = Math.max.apply(null, st.ids.map(id => tot[id])); win = st.ids.filter(id => tot[id] === mx); }
-  st.result = { win, bonus: 10, imp: st.imp, r: st.r, votes, d, tot, disc, round: room.round, rounds: room.rounds, at: Date.now() };
+  st.result = { win, bonus: win.length ? Math.floor(10 / win.length) : 0, imp: st.imp, r: st.r, votes, d, tot, disc, round: room.round, rounds: room.rounds, at: Date.now() };
 }
 function stateOf(room, cid) {
   const st = room.started, now = Date.now();
@@ -60,11 +67,96 @@ function send(res, code, body, extra) {
   res.writeHead(code, Object.assign({ 'Content-Type': 'text/plain; charset=utf-8' }, CORS, extra || {}));
   res.end(body);
 }
+
+// ---- accounts (Supabase REST when SUPA_URL + SUPA_KEY are set, in-memory otherwise) ----
+const SUPA_URL = (process.env.SUPA_URL || '').replace(/\/+$/, ''), SUPA_KEY = process.env.SUPA_KEY || '';
+const memAcc = new Map();
+let lastDbPing = 0;
+async function dbFetch(path, opt) {
+  const r = await fetch(SUPA_URL + '/rest/v1/' + path, Object.assign({ headers: { apikey: SUPA_KEY, Authorization: 'Bearer ' + SUPA_KEY, 'Content-Type': 'application/json', Prefer: 'return=representation' } }, opt));
+  const tx = await r.text();
+  if (!r.ok) throw new Error('db ' + r.status + ' ' + tx.slice(0, 200));
+  return tx ? JSON.parse(tx) : [];
+}
+async function accGet(u) {
+  if (!SUPA_URL) return memAcc.get(u) || null;
+  const a = await dbFetch('accounts?username=eq.' + encodeURIComponent(u) + '&select=*');
+  return a[0] || null;
+}
+async function accPut(row, create) {
+  if (!SUPA_URL) { memAcc.set(row.username, Object.assign({}, row)); return; }
+  if (create) await dbFetch('accounts', { method: 'POST', body: JSON.stringify(row) });
+  else await dbFetch('accounts?username=eq.' + encodeURIComponent(row.username), { method: 'PATCH', body: JSON.stringify({ tok: row.tok, pts: row.pts, rids: row.rids }) });
+}
+const sha = s => crypto.createHash('sha256').update(s).digest('hex');
+const accQ = new Map(); // serialize per user so two phones cannot race
+function accLock(u, fn) {
+  const prev = accQ.get(u) || Promise.resolve();
+  const next = prev.then(fn, fn);
+  accQ.set(u, next.catch(() => {}));
+  return next;
+}
+async function accHandle(d) {
+  const t = d.t, u = String(d.u || '').trim().toLowerCase();
+  if (!/^[a-z0-9_\u0600-\u06ff]{3,20}$/.test(u)) return [400, 'اسم المستخدم 3 لـ 20 حرف أو رقم'];
+  return accLock(u, async () => {
+    if (t === 'signup') {
+      const p = String(d.p || '');
+      if (p.length < 6 || p.length > 64) return [400, 'كلمة السر 6 حروف على الأقل'];
+      if (await accGet(u)) return [409, 'الاسم ده مأخوذ'];
+      const salt = crypto.randomBytes(16).toString('hex'), hash = crypto.scryptSync(p, salt, 32).toString('hex');
+      const tok = crypto.randomBytes(24).toString('hex');
+      let pts = Math.floor(+d.init) || 0; pts = Math.max(-9, Math.min(500, pts));
+      await accPut({ username: u, salt, hash, tok: sha(tok), pts, rids: [] }, true);
+      return [200, { tok, pts }];
+    }
+    const a = await accGet(u);
+    if (t === 'login') {
+      if (!a) return [403, 'الاسم أو كلمة السر غلط'];
+      const h = crypto.scryptSync(String(d.p || ''), a.salt, 32).toString('hex');
+      if (!crypto.timingSafeEqual(Buffer.from(h), Buffer.from(a.hash))) return [403, 'الاسم أو كلمة السر غلط'];
+      const tok = crypto.randomBytes(24).toString('hex');
+      a.tok = sha(tok); await accPut(a, false);
+      return [200, { tok, pts: a.pts }];
+    }
+    if (!a || a.tok !== sha(String(d.tok || ''))) return [403, 'سجل دخول تاني'];
+    if (t === 'get') return [200, { pts: a.pts }];
+    if (t === 'add') {
+      const rid = String(d.rid || '').slice(0, 40);
+      const dd = Math.max(-60, Math.min(60, Math.floor(+d.d) || 0)), bb = Math.max(0, Math.min(10, Math.floor(+d.b) || 0));
+      const rids = Array.isArray(a.rids) ? a.rids : [];
+      if (rid && rids.indexOf(rid) >= 0) return [200, { pts: a.pts, dup: true }];
+      let bal = a.pts + dd; if (bal <= -10) bal = 0; bal += bb;
+      a.pts = bal; if (rid) { rids.push(rid); a.rids = rids.slice(-60); }
+      await accPut(a, false);
+      return [200, { pts: bal }];
+    }
+    return [400, 'bad type'];
+  });
+}
+
 http.createServer((req, res) => {
   const ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
   const u = new URL(req.url, 'http://x');
   if (req.method === 'OPTIONS') return send(res, 204, '');
-  if (u.pathname === '/' || u.pathname === '/health') return send(res, 200, 'ok');
+  if (u.pathname === '/' || u.pathname === '/health') {
+    if (SUPA_URL && Date.now() - lastDbPing > 3600e3) { lastDbPing = Date.now(); dbFetch('accounts?select=username&limit=1').catch(e => console.log('db ping', e.message)); }
+    return send(res, 200, 'ok');
+  }
+  if (u.pathname === '/acc') {
+    if (req.method !== 'POST') return send(res, 405, 'method');
+    if (limited('acc:' + ip, 60)) return send(res, 429, 'slow down');
+    let body = '';
+    req.on('data', c => { body += c; if (body.length > 2000) req.destroy(); });
+    req.on('end', () => {
+      let d; try { d = JSON.parse(body); } catch (e) { return send(res, 400, 'bad json'); }
+      if (!d || ['signup', 'login', 'get', 'add'].indexOf(d.t) < 0) return send(res, 400, 'bad msg');
+      accHandle(d).then(r => send(res, r[0], typeof r[1] === 'string' ? r[1] : JSON.stringify(r[1]), typeof r[1] === 'string' ? {} : { 'Content-Type': 'application/json' }))
+        .catch(e => { console.log('acc error', e.message); send(res, 500, 'خطأ في السيرفر'); });
+    });
+    return;
+  }
+
 
   const fm = /^\/f\/([A-HJ-NP-Z2-9]{6})$/.exec(u.pathname);
   if (fm) {
@@ -197,7 +289,7 @@ http.createServer((req, res) => {
         if (d.t === 'vote' && st.goAt && !st.result) {
           const v = String(d.v || '');
           if (v !== cid && st.ids.indexOf(v) >= 0) st.votes.set(cid, v);
-          if (st.votes.size >= st.ids.length) resolve(room);
+          if (st.ids.every(id => id === st.imp || st.votes.has(id))) resolve(room);
         }
         if (d.t === 'close' && st.goAt && !st.result && cid === room.leader) resolve(room);
         if (d.t === 'again' && st.result && !room.next && (cid === room.leader || now - st.result.at > 120000)) {
