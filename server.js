@@ -22,7 +22,7 @@ function limited(ip, max) {
   return ++h.n > max;
 }
 
-const IMP_MIN = 5; // undiscovered impostor: +1 per player who did not pick them, at least 5
+const IMP_MIN = 5; // undiscovered impostor: room under 5 players = 5 points; 5 or more = number of players who did not pick them
 function newRound(ids) {
   return { ids, imp: ids[crypto.randomInt(ids.length)], r: crypto.randomInt(2147483647), seen: new Set(), ready: new Set(), startAt: 0, goAt: 0, votes: new Map(), result: null, voice: new Set(), mail: new Map() };
 }
@@ -36,7 +36,7 @@ function resolve(room) {
   for (const id of st.ids) d[id] = 0;
   for (const [voter, tgt] of st.votes) if (voter !== st.imp) d[voter] = tgt === st.imp ? 1 : -1;
   const nonPick = st.ids.filter(id => id !== st.imp && st.votes.get(id) !== st.imp).length;
-  d[st.imp] = disc ? -tally[st.imp] : Math.max(IMP_MIN, nonPick);
+  d[st.imp] = disc ? -tally[st.imp] : (st.ids.length < 5 ? IMP_MIN : nonPick);
   const tot = {};
   for (const id of st.ids) { room.scores[id] = (room.scores[id] || 0) + d[id]; tot[id] = room.scores[id]; }
   const votes = {}; for (const [a, b] of st.votes) votes[a] = b;
