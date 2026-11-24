@@ -50,6 +50,7 @@ function resolve(room) {
   let win = [];
   if (room.round >= room.rounds) { const mx = Math.max.apply(null, st.ids.map(id => tot[id])); win = st.ids.filter(id => tot[id] === mx); }
   st.result = { win, bonus: win.length ? Math.floor(10 / win.length) : 0, imp: st.imp, r: st.r, votes, d, tot, disc, round: room.round, rounds: room.rounds, at: Date.now() };
+  room.hist = room.hist || {}; room.hist[room.round] = { d, win: win.slice(), bonus: st.result.bonus, ids: st.ids.slice() };
 }
 function stateOf(room, cid, since) {
   const st = room.started, now = Date.now();
@@ -92,6 +93,8 @@ async function accPut(row, create) {
   else await dbFetch('accounts?username=eq.' + encodeURIComponent(row.username), { method: 'PATCH', body: JSON.stringify({ tok: row.tok, pts: row.pts, rids: row.rids, items: row.items || '' }) });
 }
 const sha = s => crypto.createHash('sha256').update(s).digest('hex');
+const loginFails = new Map();
+setInterval(() => { const n = Date.now(); for (const [k, v] of loginFails) if (n - v.t > 600000) loginFails.delete(k); }, 300000).unref();
 const accQ = new Map(); // serialize per user so two phones cannot race
 function accLock(u, fn) {
   const prev = accQ.get(u) || Promise.resolve();
@@ -110,15 +113,18 @@ async function accHandle(d) {
       const salt = crypto.randomBytes(16).toString('hex'), hash = crypto.scryptSync(p, salt, 32).toString('hex');
       const tok = crypto.randomBytes(24).toString('hex');
       const its = String(d.items || '').split(',').filter((x, i, a) => itemPrice(x) > 0 && a.indexOf(x) === i).join(',');
-      let pts = Math.floor(+d.init) || 0; pts = Math.max(-9, Math.min(500, pts));
+      let pts = Math.floor(+d.init) || 0; pts = Math.max(0, Math.min(40, pts));
       await accPut({ username: u, salt, hash, tok: sha(tok), pts, rids: [], items: its }, true);
       return [200, { tok, pts, items: its }];
     }
     const a = await accGet(u);
     if (t === 'login') {
-      if (!a) return [403, 'الاسم أو كلمة السر غلط'];
+      const f = loginFails.get(u) || { n: 0, t: 0 };
+      if (f.n >= 8 && Date.now() - f.t < 600000) return [429, 'محاولات كتير، استنى 10 دقايق'];
+      if (!a) { loginFails.set(u, { n: f.n + 1, t: Date.now() }); return [403, 'الاسم أو كلمة السر غلط']; }
       const h = crypto.scryptSync(String(d.p || ''), a.salt, 32).toString('hex');
-      if (!crypto.timingSafeEqual(Buffer.from(h), Buffer.from(a.hash))) return [403, 'الاسم أو كلمة السر غلط'];
+      if (!crypto.timingSafeEqual(Buffer.from(h), Buffer.from(a.hash))) { loginFails.set(u, { n: (f.n >= 8 && Date.now() - f.t >= 600000 ? 0 : f.n) + 1, t: Date.now() }); return [403, 'الاسم أو كلمة السر غلط']; }
+      loginFails.delete(u);
       const tok = crypto.randomBytes(24).toString('hex');
       a.tok = sha(tok); await accPut(a, false);
       return [200, { tok, pts: a.pts, items: a.items || '' }];
@@ -135,12 +141,19 @@ async function accHandle(d) {
       return [200, { pts: a.pts, items: a.items }];
     }
     if (t === 'add') {
-      const rid = String(d.rid || '').slice(0, 40);
-      const dd = Math.max(-60, Math.min(60, Math.floor(+d.d) || 0)), bb = Math.max(0, Math.min(10, Math.floor(+d.b) || 0));
+      // points are computed from the server's own round result; the client only names the room, round and itself
+      const rid = String(d.rid || '').slice(0, 40), cid = String(d.c || ''), round = Math.floor(+d.round);
+      const room = rooms.get(String(d.code || '')), h = room && room.hist && room.hist[round];
+      if (!h || h.ids.indexOf(cid) < 0) return [404, 'no such round'];
       const rids = Array.isArray(a.rids) ? a.rids : [];
       if (rid && rids.indexOf(rid) >= 0) return [200, { pts: a.pts, dup: true }];
-      let bal = a.pts + dd; if (bal <= -10) bal = 0; bal += bb;
-      a.pts = bal; if (rid) { rids.push(rid); a.rids = rids.slice(-60); }
+      room.claimed = room.claimed || new Set();
+      const ck = round + ':' + cid;
+      if (room.claimed.has(ck)) return [409, 'already claimed'];
+      room.claimed.add(ck);
+      const dd = h.d[cid] || 0, bb = h.win.indexOf(cid) >= 0 ? h.bonus : 0;
+      let bal = a.pts + dd; if (bal < 0) bal = 0; bal += bb;
+      a.pts = bal; rids.push(rid || ck); a.rids = rids.slice(-60);
       await accPut(a, false);
       return [200, { pts: bal }];
     }
