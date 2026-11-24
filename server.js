@@ -36,7 +36,7 @@ function resolve(room) {
   for (const id of st.ids) d[id] = 0;
   for (const [voter, tgt] of st.votes) if (voter !== st.imp) d[voter] = tgt === st.imp ? 2 : -1;
   const nonPick = st.ids.filter(id => id !== st.imp && st.votes.get(id) !== st.imp).length;
-  d[st.imp] = (st.ids.length < 5 && tally[st.imp] === st.ids.length - 1) ? -2 : disc ? -tally[st.imp] : (st.ids.length < 5 ? Math.max(0, IMP_MIN - tally[st.imp]) : nonPick);
+  d[st.imp] = (st.ids.length < 5 && disc) ? -2 : disc ? -tally[st.imp] : (st.ids.length < 5 ? Math.max(0, IMP_MIN - tally[st.imp]) : nonPick);
   const tot = {};
   for (const id of st.ids) { room.scores[id] = (room.scores[id] || 0) + d[id]; tot[id] = room.scores[id]; }
   const votes = {}; for (const [a, b] of st.votes) votes[a] = b;
