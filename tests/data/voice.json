@@ -1,0 +1,8 @@
+{
+  "_doc": "Voice mode budgets from the contract (ms). Initial tk.u is checked against these at the start of a phase. Real expiry is not tested.",
+  "revealMs": 10000,
+  "askMs": 60000,
+  "ansMs": 60000,
+  "discMs": 300000,
+  "slackMs": 8000
+}
