@@ -56,7 +56,7 @@ function stateOf(room, cid, since) {
   const st = room.started, now = Date.now();
   return { k: st.seen.size, n: st.ids.length, el: st.goAt ? now - st.goAt : null, nx: room.next || null,
     rd: st.ready.size, rm: st.ready.has(cid), ca: st.startAt ? st.startAt - now : null, sn: st.seen.has(cid),
-    vt: st.votes.size, mine: st.votes.get(cid) || null, round: room.round, rounds: room.rounds, lead: room.leader, res: st.result, fx: (st.fx || []).filter(e => e.i > (+since || 0)), fxs: st.fxs || 0 };
+    vt: st.votes.size, mine: st.votes.get(cid) || null, round: room.round, rounds: room.rounds, dur: room.dur || 180, lead: room.leader, res: st.result, fx: (st.fx || []).filter(e => e.i > (+since || 0)), fxs: st.fxs || 0 };
 }
 function sendRole(room, cl) {
   const st = room.started;
@@ -70,8 +70,10 @@ function send(res, code, body, extra) {
 }
 
 // ---- store catalog: stickers s1..sN cost 10, sounds a1..aM cost 5 ----
-const STK = 15, SND = 3;
-const itemPrice = id => { const m = /^([sa])(\d{1,3})$/.exec(String(id)); if (!m) return 0; const n = +m[2]; if (m[1] === 's') return n >= 1 && n <= STK ? 10 : 0; return n >= 1 && n <= SND ? 5 : 0; };
+const CATALOG = (() => { try { return JSON.parse(require('fs').readFileSync(require('path').join(__dirname, 'catalog.json'), 'utf8')); } catch (e) { console.log('catalog.json missing', e.message); return { stickers: [], sounds: [], frames: [] }; } })();
+const PRICES = new Map();
+for (const k of ['stickers', 'sounds', 'frames']) for (const x of CATALOG[k]) PRICES.set(x.id, x.price | 0);
+const itemPrice = id => PRICES.get(String(id)) || 0;
 // ---- accounts (Supabase REST when SUPA_URL + SUPA_KEY are set, in-memory otherwise) ----
 const SUPA_URL = (process.env.SUPA_URL || '').replace(/\/+$/, ''), SUPA_KEY = process.env.SUPA_KEY || '';
 const memAcc = new Map();
@@ -90,7 +92,7 @@ async function accGet(u) {
 async function accPut(row, create) {
   if (!SUPA_URL) { memAcc.set(row.username, Object.assign({}, row)); return; }
   if (create) await dbFetch('accounts', { method: 'POST', body: JSON.stringify(row) });
-  else await dbFetch('accounts?username=eq.' + encodeURIComponent(row.username), { method: 'PATCH', body: JSON.stringify({ tok: row.tok, pts: row.pts, rids: row.rids, items: row.items || '' }) });
+  else await dbFetch('accounts?username=eq.' + encodeURIComponent(row.username), { method: 'PATCH', body: JSON.stringify({ salt: row.salt, hash: row.hash, tok: row.tok, pts: row.pts, rids: row.rids, items: row.items || '' }) });
 }
 const sha = s => crypto.createHash('sha256').update(s).digest('hex');
 const loginFails = new Map();
@@ -130,6 +132,18 @@ async function accHandle(d) {
       return [200, { tok, pts: a.pts, items: a.items || '' }];
     }
     if (!a || a.tok !== sha(String(d.tok || ''))) return [403, 'سجل دخول تاني'];
+    if (t === 'chpw') {
+      const f = loginFails.get(u) || { n: 0, t: 0 };
+      if (f.n >= 8 && Date.now() - f.t < 600000) return [429, 'محاولات كتير، استنى 10 دقايق'];
+      const np = String(d.n || '');
+      if (np.length < 6 || np.length > 64) return [400, 'كلمة السر 6 حروف على الأقل'];
+      const h0 = crypto.scryptSync(String(d.p || ''), a.salt, 32).toString('hex');
+      if (!crypto.timingSafeEqual(Buffer.from(h0), Buffer.from(a.hash))) { loginFails.set(u, { n: (f.n >= 8 && Date.now() - f.t >= 600000 ? 0 : f.n) + 1, t: Date.now() }); return [403, 'كلمة السر الحالية غلط']; }
+      loginFails.delete(u);
+      a.salt = crypto.randomBytes(16).toString('hex'); a.hash = crypto.scryptSync(np, a.salt, 32).toString('hex');
+      await accPut(a, false);
+      return [200, { ok: 1 }];
+    }
     if (t === 'get') return [200, { pts: a.pts, items: a.items || '' }];
     if (t === 'buy') {
       const id = String(d.item || ''), price = itemPrice(id), own = String(a.items || '').split(',').filter(Boolean);
@@ -182,7 +196,7 @@ http.createServer((req, res) => {
     req.on('data', c => { body += c; if (body.length > 2000) req.destroy(); });
     req.on('end', () => {
       let d; try { d = JSON.parse(body); } catch (e) { return send(res, 400, 'bad json'); }
-      if (!d || ['signup', 'login', 'get', 'add', 'buy'].indexOf(d.t) < 0) return send(res, 400, 'bad msg');
+      if (!d || ['signup', 'login', 'get', 'add', 'buy', 'chpw'].indexOf(d.t) < 0) return send(res, 400, 'bad msg');
       accHandle(d).then(r => send(res, r[0], typeof r[1] === 'string' ? r[1] : JSON.stringify(r[1]), typeof r[1] === 'string' ? {} : { 'Content-Type': 'application/json' }))
         .catch(e => { console.log('acc error', e.message); send(res, 500, 'خطأ في السيرفر'); });
     });
@@ -283,7 +297,7 @@ http.createServer((req, res) => {
         if (!d.host || d.t !== 'j' || n < 2 || n > 9) return send(res, 404, 'no room');
         if (rooms.size >= MAX_ROOMS || limited('new:' + ip, 20)) return send(res, 429, 'busy');
         const rounds = Math.max(1, Math.min(20, Math.floor(+d.rounds) || 3));
-        room = { n, msgs: [], clients: new Set(), roster: [], started: null, t: Date.now(), rounds, round: 1, leader: String(d.c).slice(0, 20), scores: {} };
+        room = { n, msgs: [], clients: new Set(), roster: [], started: null, t: Date.now(), rounds, dur: Math.max(60, Math.min(900, Math.floor(+d.dur) || 180)), round: 1, leader: String(d.c).slice(0, 20), scores: {} };
         rooms.set(code, room);
       }
       delete d.host;
@@ -296,7 +310,7 @@ http.createServer((req, res) => {
         const now = Date.now();
         if (d.t === 'fx') {
           const id = String(d.k || '');
-          if (!st.goAt || !itemPrice(id)) return send(res, 400, 'bad fx');
+          if (!st.goAt || !/^[sa]/.test(id) || !itemPrice(id)) return send(res, 400, 'bad fx');
           st.fxT = st.fxT || new Map(); st.fx = st.fx || []; st.fxs = st.fxs || 0;
           if (now - (st.fxT.get(cid) || 0) < 3000) return send(res, 429, 'wait');
           st.fxT.set(cid, now); st.fxs++;
@@ -342,7 +356,7 @@ http.createServer((req, res) => {
           for (let tries = 0; tries < 20; tries++) { const c2 = String(cat) + code[1] + String(1000 + crypto.randomInt(1000)).slice(1); if (!rooms.has(c2)) { nc = c2; break; } }
           if (!nc || rooms.size >= MAX_ROOMS) return send(res, 429, 'busy');
           const ids = st.ids.slice();
-          rooms.set(nc, { n: room.n, msgs: room.msgs.slice(), clients: new Set(), roster: room.roster.slice(), started: Object.assign(newRound(ids), { voice: new Set(st.voice) }), t: now, rounds: room.rounds, round: last ? 1 : room.round + 1, leader: room.leader, scores: last ? {} : Object.assign({}, room.scores) });
+          rooms.set(nc, { n: room.n, msgs: room.msgs.slice(), clients: new Set(), roster: room.roster.slice(), started: Object.assign(newRound(ids), { voice: new Set(st.voice) }), t: now, rounds: room.rounds, dur: room.dur, round: last ? 1 : room.round + 1, leader: room.leader, scores: last ? {} : Object.assign({}, room.scores) });
           room.next = nc;
         }
         return send(res, 200, JSON.stringify(stateOf(room, cid, d.s)), J);
