@@ -94,6 +94,9 @@ async function accPut(row, create) {
   if (create) await dbFetch('accounts', { method: 'POST', body: JSON.stringify(row) });
   else await dbFetch('accounts?username=eq.' + encodeURIComponent(row.username), { method: 'PATCH', body: JSON.stringify({ salt: row.salt, hash: row.hash, tok: row.tok, pts: row.pts, rids: row.rids, items: row.items || '' }) });
 }
+const signups = new Map();
+function signupLimited(ip) { if (/^(::1|127\.0\.0\.1|::ffff:127\.0\.0\.1)$/.test(ip)) return false; const n = Date.now(), h = signups.get(ip); if (!h || n - h.t > 3600e3) { signups.set(ip, { n: 1, t: n }); return false; } return ++h.n > 6; }
+setInterval(() => { const n = Date.now(); for (const [k, v] of signups) if (n - v.t > 3600e3) signups.delete(k); }, 600000).unref();
 const sha = s => crypto.createHash('sha256').update(s).digest('hex');
 const loginFails = new Map();
 setInterval(() => { const n = Date.now(); for (const [k, v] of loginFails) if (n - v.t > 600000) loginFails.delete(k); }, 300000).unref();
@@ -109,6 +112,7 @@ async function accHandle(d) {
   if (!/^[a-z0-9_\u0600-\u06ff]{3,20}$/.test(u)) return [400, 'اسم المستخدم 3 لـ 20 حرف أو رقم'];
   return accLock(u, async () => {
     if (t === 'signup') {
+      if (d._ip && signupLimited(d._ip)) return [429, 'محاولات تسجيل كتير، جرب بعدين'];
       const p = String(d.p || '');
       if (p.length < 6 || p.length > 64) return [400, 'كلمة السر 6 حروف على الأقل'];
       if (await accGet(u)) return [409, 'الاسم ده مأخوذ'];
@@ -198,7 +202,7 @@ http.createServer((req, res) => {
     req.on('end', () => {
       let d; try { d = JSON.parse(body); } catch (e) { return send(res, 400, 'bad json'); }
       if (!d || ['signup', 'login', 'get', 'add', 'buy', 'chpw'].indexOf(d.t) < 0) return send(res, 400, 'bad msg');
-      accHandle(d).then(r => send(res, r[0], typeof r[1] === 'string' ? r[1] : JSON.stringify(r[1]), typeof r[1] === 'string' ? {} : { 'Content-Type': 'application/json' }))
+      d._ip = ip; accHandle(d).then(r => send(res, r[0], typeof r[1] === 'string' ? r[1] : JSON.stringify(r[1]), typeof r[1] === 'string' ? {} : { 'Content-Type': 'application/json' }))
         .catch(e => { console.log('acc error', e.message); send(res, 500, 'خطأ في السيرفر'); });
     });
     return;
@@ -277,7 +281,7 @@ http.createServer((req, res) => {
     res.writeHead(200, Object.assign({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no' }, CORS));
     res.write('retry: 2000\n\n');
     for (const d of room.msgs) res.write('data: ' + d + '\n\n');
-    const cl = { res, cid: String(u.searchParams.get('c') || '').slice(0, 20) };
+    const cl = { res, cid: /^[A-Za-z0-9_-]{1,20}$/.test(u.searchParams.get('c') || '') ? u.searchParams.get('c') : '' };
     room.clients.add(cl);
     sendRole(room, cl);
     const ka = setInterval(() => res.write(': ka\n\n'), 20000);
@@ -291,7 +295,7 @@ http.createServer((req, res) => {
       let d;
       try { d = JSON.parse(body); } catch (e) { return send(res, 400, 'bad json'); }
       const TYPES = ['j', 'l', 'reveal', 'seen', 'state', 'again', 'ready', 'vote', 'close', 'vjoin', 'vleave', 'sig', 'sigpoll', 'fx'];
-      if (!d || TYPES.indexOf(d.t) < 0 || typeof d.c !== 'string') return send(res, 400, 'bad msg');
+      if (!d || TYPES.indexOf(d.t) < 0 || typeof d.c !== 'string' || !/^[A-Za-z0-9_-]{1,20}$/.test(d.c)) return send(res, 400, 'bad msg');
       let room = rooms.get(code);
       if (!room) {
         const n = +code[1];
@@ -372,7 +376,7 @@ http.createServer((req, res) => {
         room.roster.push(cid);
         { const un = String(d.u || '').trim().toLowerCase(); if (/^[a-z0-9_\u0600-\u06ff]{3,20}$/.test(un)) { room.acct = room.acct || {}; room.acct[cid] = un; } }
       }
-      const s = JSON.stringify({ t: d.t, v: d.v === 'fam' ? 'fam' : 'full', c: cid, n: String(d.n || '').slice(0, 14), a: String(d.a || '').slice(0, 4000) });
+      const s = JSON.stringify({ t: d.t, v: d.v === 'fam' ? 'fam' : 'full', c: cid, n: String(d.n || '').slice(0, 14), f: /^f\d{1,2}$/.test(String(d.f || '')) ? String(d.f) : '', a: String(d.a || '').slice(0, 4000) });
       room.msgs.push(s);
       for (const c of room.clients) c.res.write('data: ' + s + '\n\n');
       if (room.roster.length === room.n) {
