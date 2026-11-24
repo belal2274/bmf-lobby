@@ -21,6 +21,35 @@ function limited(ip, max) {
   if (!h || now - h.t > 60000) { h = { n: 0, t: now }; hits.set(ip, h); }
   return ++h.n > max;
 }
+
+const IMP_MIN = 5; // undiscovered impostor: +1 per player who did not pick them, at least 5
+function newRound(ids) {
+  return { ids, imp: ids[crypto.randomInt(ids.length)], r: crypto.randomInt(2147483647), seen: new Set(), ready: new Set(), startAt: 0, goAt: 0, votes: new Map(), result: null, voice: new Set(), mail: new Map() };
+}
+function resolve(room) {
+  const st = room.started;
+  const tally = {}; for (const id of st.ids) tally[id] = 0;
+  for (const v of st.votes.values()) tally[v]++;
+  const top = Math.max.apply(null, st.ids.map(id => tally[id]));
+  const disc = tally[st.imp] > 0 && tally[st.imp] === top && st.ids.filter(id => tally[id] === top).length === 1;
+  const d = {};
+  for (const id of st.ids) d[id] = 0;
+  for (const [voter, tgt] of st.votes) if (voter !== st.imp) d[voter] = tgt === st.imp ? 1 : -1;
+  const nonPick = st.ids.filter(id => id !== st.imp && st.votes.get(id) !== st.imp).length;
+  d[st.imp] = disc ? -tally[st.imp] : Math.max(IMP_MIN, nonPick);
+  const tot = {};
+  for (const id of st.ids) { room.scores[id] = (room.scores[id] || 0) + d[id]; tot[id] = room.scores[id]; }
+  const votes = {}; for (const [a, b] of st.votes) votes[a] = b;
+  let win = [];
+  if (room.round >= room.rounds) { const mx = Math.max.apply(null, st.ids.map(id => tot[id])); win = st.ids.filter(id => tot[id] === mx); }
+  st.result = { win, bonus: 10, imp: st.imp, r: st.r, votes, d, tot, disc, round: room.round, rounds: room.rounds, at: Date.now() };
+}
+function stateOf(room, cid) {
+  const st = room.started, now = Date.now();
+  return { k: st.seen.size, n: st.ids.length, el: st.goAt ? now - st.goAt : null, nx: room.next || null,
+    rd: st.ready.size, rm: st.ready.has(cid), ca: st.startAt ? st.startAt - now : null, sn: st.seen.has(cid),
+    vt: st.votes.size, mine: st.votes.get(cid) || null, round: room.round, rounds: room.rounds, lead: room.leader, res: st.result };
+}
 function sendRole(room, cl) {
   const st = room.started;
   if (!st || st.ids.indexOf(cl.cid) < 0) return;
@@ -40,7 +69,7 @@ http.createServer((req, res) => {
   const fm = /^\/f\/([A-HJ-NP-Z2-9]{6})$/.exec(u.pathname);
   if (fm) {
     const fid = fm[1];
-    if (limited(ip, 600)) return send(res, 429, 'slow down');
+    if (limited(ip, 1500)) return send(res, 429, 'slow down');
     const key = s => String(s || '').slice(0, 40);
     if (req.method === 'GET') {
       const us = users.get(fid);
@@ -101,7 +130,7 @@ http.createServer((req, res) => {
   const m = /^\/r\/(\d{5})$/.exec(u.pathname);
   if (!m) return send(res, 404, 'not found');
   const code = m[1];
-  if (limited(ip, 600)) return send(res, 429, 'slow down');
+  if (limited(ip, 1500)) return send(res, 429, 'slow down');
   if (req.method === 'GET') {
     const room = rooms.get(code);
     if (!room) return send(res, 404, 'no room');
@@ -122,39 +151,67 @@ http.createServer((req, res) => {
     req.on('end', () => {
       let d;
       try { d = JSON.parse(body); } catch (e) { return send(res, 400, 'bad json'); }
-      if (!d || (d.t !== 'j' && d.t !== 'l' && d.t !== 'reveal' && d.t !== 'seen' && d.t !== 'state' && d.t !== 'again') || typeof d.c !== 'string') return send(res, 400, 'bad msg');
+      const TYPES = ['j', 'l', 'reveal', 'seen', 'state', 'again', 'ready', 'vote', 'close', 'vjoin', 'vleave', 'sig', 'sigpoll'];
+      if (!d || TYPES.indexOf(d.t) < 0 || typeof d.c !== 'string') return send(res, 400, 'bad msg');
       let room = rooms.get(code);
       if (!room) {
         const n = +code[1];
         if (!d.host || d.t !== 'j' || n < 2 || n > 9) return send(res, 404, 'no room');
         if (rooms.size >= MAX_ROOMS || limited('new:' + ip, 20)) return send(res, 429, 'busy');
-        room = { n, msgs: [], clients: new Set(), roster: [], started: null, t: Date.now() };
+        const rounds = Math.max(1, Math.min(20, Math.floor(+d.rounds) || 3));
+        room = { n, msgs: [], clients: new Set(), roster: [], started: null, t: Date.now(), rounds, round: 1, leader: String(d.c).slice(0, 20), scores: {} };
         rooms.set(code, room);
       }
       delete d.host;
       const cid = String(d.c).slice(0, 20);
       room.t = Date.now();
-      if (d.t === 'seen' || d.t === 'state' || d.t === 'again') {
-        const st = room.started;
+      const J = { 'Content-Type': 'application/json' };
+      const st = room.started;
+      if (['reveal', 'seen', 'state', 'again', 'ready', 'vote', 'close', 'vjoin', 'vleave', 'sig', 'sigpoll'].indexOf(d.t) >= 0) {
         if (!st || st.ids.indexOf(cid) < 0) return send(res, 403, 'no');
-        if (d.t === 'seen') {
-          st.seen = st.seen || new Set(); st.seen.add(cid);
-          if (st.seen.size >= st.ids.length && !st.goAt) st.goAt = Date.now();
+        const now = Date.now();
+        if (d.t === 'vjoin') { st.voice.add(cid); return send(res, 200, JSON.stringify({ vc: [...st.voice] }), J); }
+        if (d.t === 'vleave') { st.voice.delete(cid); st.mail.delete(cid); return send(res, 200, JSON.stringify({ vc: [...st.voice] }), J); }
+        if (d.t === 'sig') {
+          const to = String(d.to || ''), dd = typeof d.d === 'string' ? d.d.slice(0, 4000) : '';
+          if (st.ids.indexOf(to) < 0 || to === cid || !dd) return send(res, 400, 'bad sig');
+          const q = st.mail.get(to) || []; if (q.length < 200) q.push({ f: cid, d: dd }); st.mail.set(to, q);
+          return send(res, 200, 'ok');
         }
-        if (d.t === 'again' && !room.next) {
+        if (d.t === 'sigpoll') {
+          const q = st.mail.get(cid) || []; st.mail.set(cid, []);
+          return send(res, 200, JSON.stringify({ m: q, vc: [...st.voice] }), J);
+        }
+        if (d.t === 'reveal') {
+          if (!st.result && st.startAt) return send(res, 403, 'later'); // old app versions never send 'ready', so they keep the old reveal flow
+          return send(res, 200, JSON.stringify({ imp: st.imp, r: st.r }), J);
+        }
+        if (d.t === 'ready' && !st.startAt) {
+          st.ready.add(cid);
+          if (st.ready.size >= st.ids.length) st.startAt = now + 3000;
+        }
+        if (d.t === 'seen' && st.startAt && now >= st.startAt) {
+          st.seen.add(cid);
+          if (st.seen.size >= st.ids.length && !st.goAt) st.goAt = now;
+        }
+        if (d.t === 'vote' && st.goAt && !st.result) {
+          const v = String(d.v || '');
+          if (v !== cid && st.ids.indexOf(v) >= 0) st.votes.set(cid, v);
+          if (st.votes.size >= st.ids.length) resolve(room);
+        }
+        if (d.t === 'close' && st.goAt && !st.result && cid === room.leader) resolve(room);
+        if (d.t === 'again' && st.result && !room.next && (cid === room.leader || now - st.result.at > 120000)) {
+          const last = room.round >= room.rounds;
+          if (last && !d.ng) return send(res, 400, 'finished');
           const cat = Math.max(1, Math.min(9, +d.cat || +code[0]));
           let nc = '';
           for (let tries = 0; tries < 20; tries++) { const c2 = String(cat) + code[1] + String(1000 + crypto.randomInt(1000)).slice(1); if (!rooms.has(c2)) { nc = c2; break; } }
           if (!nc || rooms.size >= MAX_ROOMS) return send(res, 429, 'busy');
           const ids = st.ids.slice();
-          rooms.set(nc, { n: room.n, msgs: room.msgs.slice(), clients: new Set(), roster: room.roster.slice(), started: { ids, imp: ids[crypto.randomInt(ids.length)], r: crypto.randomInt(2147483647) }, t: Date.now() });
+          rooms.set(nc, { n: room.n, msgs: room.msgs.slice(), clients: new Set(), roster: room.roster.slice(), started: Object.assign(newRound(ids), { voice: new Set(st.voice) }), t: now, rounds: room.rounds, round: last ? 1 : room.round + 1, leader: room.leader, scores: last ? {} : Object.assign({}, room.scores) });
           room.next = nc;
         }
-        return send(res, 200, JSON.stringify({ k: st.seen ? st.seen.size : 0, n: st.ids.length, el: st.goAt ? Date.now() - st.goAt : null, nx: room.next || null }), { 'Content-Type': 'application/json' });
-      }
-      if (d.t === 'reveal') {
-        if (!room.started || room.started.ids.indexOf(cid) < 0) return send(res, 403, 'no');
-        return send(res, 200, JSON.stringify({ imp: room.started.imp, r: room.started.r }), { 'Content-Type': 'application/json' });
+        return send(res, 200, JSON.stringify(stateOf(room, cid)), J);
       }
       if (room.started) return send(res, 200, 'ok');
       if (d.t === 'l') {
@@ -168,8 +225,7 @@ http.createServer((req, res) => {
       room.msgs.push(s);
       for (const c of room.clients) c.res.write('data: ' + s + '\n\n');
       if (room.roster.length === room.n) {
-        const ids = room.roster.slice();
-        room.started = { ids, imp: ids[crypto.randomInt(ids.length)], r: crypto.randomInt(2147483647) };
+        room.started = newRound(room.roster.slice());
         for (const c of room.clients) sendRole(room, c);
       }
       send(res, 200, 'ok');
