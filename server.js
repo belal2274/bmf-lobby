@@ -169,6 +169,12 @@ http.createServer((req, res) => {
     if (SUPA_URL && Date.now() - lastDbPing > 3600e3) { lastDbPing = Date.now(); dbFetch('accounts?select=username&limit=1').catch(e => console.log('db ping', e.message)); }
     return send(res, 200, 'ok');
   }
+  if (u.pathname === '/keepalive') {
+    // tiny read of the accounts table so Supabase counts it as activity; fails loudly so the scheduled job turns red
+    if (!SUPA_URL) return send(res, 200, 'ok (memory mode)');
+    lastDbPing = Date.now();
+    return dbFetch('accounts?select=username&limit=1').then(() => send(res, 200, 'ok db')).catch(e => { console.log('keepalive db', e.message); send(res, 502, 'db down'); });
+  }
   if (u.pathname === '/acc') {
     if (req.method !== 'POST') return send(res, 405, 'method');
     if (limited('acc:' + ip, 60)) return send(res, 429, 'slow down');

@@ -1,10 +1,36 @@
 name: keepalive
+# Keeps the free services awake. No secrets needed: the server itself reads Supabase.
 on:
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '*/5 * * * *'    # Render free sleeps after ~15 min idle
+    - cron: '17 3 * * *'     # daily: server reads Supabase (counts as project activity)
+    - cron: '41 4 1,15 * *'  # twice a month: heartbeat commit so GitHub never disables schedules (60 days inactivity rule)
   workflow_dispatch:
+permissions:
+  contents: write
 jobs:
   ping:
+    if: github.event.schedule == '*/5 * * * *' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
-      - run: curl -s -m 60 --retry 3 https://bmf-lobby.onrender.com/health
+      - run: curl -s -m 90 --retry 3 --retry-delay 5 https://bmf-lobby.onrender.com/health
+  db:
+    if: github.event.schedule == '17 3 * * *' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - run: curl -sf -m 120 --retry 4 --retry-delay 20 --retry-all-errors https://bmf-lobby.onrender.com/keepalive
+  heartbeat:
+    if: github.event.schedule == '41 4 1,15 * *' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: keepalive-heartbeat
+        continue-on-error: true
+      - name: empty commit on a side branch
+        run: |
+          git config user.name "keepalive-bot"
+          git config user.email "keepalive@users.noreply.github.com"
+          git checkout -B keepalive-heartbeat
+          git commit --allow-empty -m "heartbeat $(date -u +%F)"
+          git push origin keepalive-heartbeat
