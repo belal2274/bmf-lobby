@@ -72,7 +72,7 @@ function advance(room) {
   for (let g = 0; g < 50 && now >= tk.u; g++) {
     if (tk.ph === 'ask') { if (tk.t) { tk.ph = 'ans'; tk.u = now + RULES.ans * 1000; } else nextTurn(); }
     else if (tk.ph === 'ans') nextTurn();
-    else { tk.cyc++; tk.i = 0; tk.ph = 'ask'; tk.a = ord[0]; tk.t = null; tk.u = now + RULES.ask * 1000; }
+    else { tk.cyc++; tk.i = 0; tk.ph = 'ask'; tk.a = ord[0]; tk.t = null; tk.dn = null; tk.u = now + RULES.ask * 1000; }
   }
 }
 function talkAct(room, cid, d) {
@@ -93,7 +93,7 @@ function stateOf(room, cid, since) {
   const st = room.started, now = Date.now();
   return { k: st.seen.size, n: st.ids.length, el: st.goAt ? now - st.goAt : null, nx: room.next || null,
     rd: st.ready.size, rm: st.ready.has(cid), ca: st.startAt ? st.startAt - now : null, sn: st.seen.has(cid),
-    vt: st.votes.size, mine: st.votes.get(cid) || null, round: room.round, rounds: room.rounds, dur: room.dur || 180, vm: room.vm || 'ext', rv: st.revealAt && !st.goAt ? Math.max(0, st.revealAt - now) : null, tk: st.tk && !st.result ? { ph: st.tk.ph, a: st.tk.a, t: st.tk.t, u: Math.max(0, st.tk.u - now), cyc: st.tk.cyc, dn: st.tk.dn ? st.tk.dn.size : 0, dm: !!(st.tk.dn && st.tk.dn.has(cid)) } : null, lead: room.leader, res: st.result, fx: (st.fx || []).filter(e => e.i > (+since || 0)), fxs: st.fxs || 0 };
+    vt: st.votes.size, mine: st.votes.get(cid) || null, round: room.round, rounds: room.rounds, dur: room.dur || 180, vm: room.vm || 'ext', rv: st.revealAt && !st.goAt ? Math.max(0, st.revealAt - now) : null, tk: st.tk && !st.result ? { ph: st.tk.ph, a: st.tk.a, t: st.tk.t, u: Math.max(0, st.tk.u - now), cyc: st.tk.cyc, dn: st.tk.ph === 'disc' && st.tk.dn ? st.tk.dn.size : 0, dm: !!(st.tk.ph === 'disc' && st.tk.dn && st.tk.dn.has(cid)) } : null, lead: room.leader, res: st.result, fx: (st.fx || []).filter(e => e.i > (+since || 0)), fxs: st.fxs || 0 };
 }
 function sendRole(room, cl) {
   const st = room.started;
