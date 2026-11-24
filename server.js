@@ -159,6 +159,7 @@ async function accHandle(d) {
       const rid = String(d.rid || '').slice(0, 40), cid = String(d.c || ''), round = Math.floor(+d.round);
       const room = rooms.get(String(d.code || '')), h = room && room.hist && room.hist[round];
       if (!h || h.ids.indexOf(cid) < 0) return [404, 'no such round'];
+      if (!room.acct || room.acct[cid] !== u) return [403, 'not your player'];
       const rids = Array.isArray(a.rids) ? a.rids : [];
       if (rid && rids.indexOf(rid) >= 0) return [200, { pts: a.pts, dup: true }];
       room.claimed = room.claimed || new Set();
@@ -296,8 +297,9 @@ http.createServer((req, res) => {
         const n = +code[1];
         if (!d.host || d.t !== 'j' || n < 2 || n > 9) return send(res, 404, 'no room');
         if (rooms.size >= MAX_ROOMS || limited('new:' + ip, 20)) return send(res, 429, 'busy');
-        const rounds = Math.max(1, Math.min(20, Math.floor(+d.rounds) || 3));
-        room = { n, msgs: [], clients: new Set(), roster: [], started: null, t: Date.now(), rounds, dur: Math.max(60, Math.min(900, Math.floor(+d.dur) || 180)), round: 1, leader: String(d.c).slice(0, 20), scores: {} };
+        const rr = Math.floor(+d.rounds), rounds = Number.isFinite(rr) ? Math.max(1, Math.min(20, rr)) : 3;
+        const dd0 = Math.floor(+d.dur), dur0 = Number.isFinite(dd0) ? Math.max(60, Math.min(900, dd0)) : 180;
+        room = { n, msgs: [], clients: new Set(), roster: [], started: null, t: Date.now(), rounds, dur: dur0, round: 1, leader: String(d.c).slice(0, 20), scores: {} };
         rooms.set(code, room);
       }
       delete d.host;
@@ -356,7 +358,7 @@ http.createServer((req, res) => {
           for (let tries = 0; tries < 20; tries++) { const c2 = String(cat) + code[1] + String(1000 + crypto.randomInt(1000)).slice(1); if (!rooms.has(c2)) { nc = c2; break; } }
           if (!nc || rooms.size >= MAX_ROOMS) return send(res, 429, 'busy');
           const ids = st.ids.slice();
-          rooms.set(nc, { n: room.n, msgs: room.msgs.slice(), clients: new Set(), roster: room.roster.slice(), started: Object.assign(newRound(ids), { voice: new Set(st.voice) }), t: now, rounds: room.rounds, dur: room.dur, round: last ? 1 : room.round + 1, leader: room.leader, scores: last ? {} : Object.assign({}, room.scores) });
+          rooms.set(nc, { acct: Object.assign({}, room.acct || {}), n: room.n, msgs: room.msgs.slice(), clients: new Set(), roster: room.roster.slice(), started: Object.assign(newRound(ids), { voice: new Set(st.voice) }), t: now, rounds: room.rounds, dur: room.dur, round: last ? 1 : room.round + 1, leader: room.leader, scores: last ? {} : Object.assign({}, room.scores) });
           room.next = nc;
         }
         return send(res, 200, JSON.stringify(stateOf(room, cid, d.s)), J);
@@ -368,6 +370,7 @@ http.createServer((req, res) => {
       } else {
         if (room.roster.indexOf(cid) >= 0 || room.roster.length >= room.n) return send(res, 200, 'ok');
         room.roster.push(cid);
+        { const un = String(d.u || '').trim().toLowerCase(); if (/^[a-z0-9_\u0600-\u06ff]{3,20}$/.test(un)) { room.acct = room.acct || {}; room.acct[cid] = un; } }
       }
       const s = JSON.stringify({ t: d.t, v: d.v === 'fam' ? 'fam' : 'full', c: cid, n: String(d.n || '').slice(0, 14), a: String(d.a || '').slice(0, 4000) });
       room.msgs.push(s);
