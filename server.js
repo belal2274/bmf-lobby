@@ -34,7 +34,7 @@ function resolve(room) {
   const disc = tally[st.imp] > 0 && tally[st.imp] === top && st.ids.filter(id => tally[id] === top).length === 1;
   const d = {};
   for (const id of st.ids) d[id] = 0;
-  for (const [voter, tgt] of st.votes) if (voter !== st.imp) d[voter] = tgt === st.imp ? 1 : -1;
+  for (const [voter, tgt] of st.votes) if (voter !== st.imp) d[voter] = tgt === st.imp ? 2 : -1;
   const nonPick = st.ids.filter(id => id !== st.imp && st.votes.get(id) !== st.imp).length;
   d[st.imp] = (st.ids.length < 5 && tally[st.imp] === st.ids.length - 1) ? -2 : disc ? -tally[st.imp] : (st.ids.length < 5 ? Math.max(0, IMP_MIN - tally[st.imp]) : nonPick);
   const tot = {};
