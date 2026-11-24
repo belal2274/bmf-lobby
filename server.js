@@ -1,4 +1,6 @@
 // BMF lobby server: tiny in-memory room relay with Server-Sent Events. No dependencies.
+process.on('uncaughtException', e => console.log('uncaught', e && e.stack || e));
+process.on('unhandledRejection', e => console.log('unhandled', e && e.stack || e));
 const http = require('http');
 const crypto = require('crypto');
 const PORT = process.env.PORT || 8080;
@@ -52,11 +54,46 @@ function resolve(room) {
   st.result = { win, bonus: win.length ? Math.floor(10 / win.length) : 0, imp: st.imp, r: st.r, votes, d, tot, disc, round: room.round, rounds: room.rounds, at: Date.now() };
   room.hist = room.hist || {}; room.hist[room.round] = { d, win: win.slice(), bonus: st.result.bonus, ids: st.ids.slice() };
 }
+function advance(room) {
+  const st = room.started, now = Date.now();
+  if (!st || st.result) return;
+  if (!st.goAt && st.revealAt && now >= st.revealAt) st.goAt = st.revealAt;
+  if (!st.goAt) return;
+  if (now - st.goAt > RULES.cap * 1000) { resolve(room); return; }
+  if (room.vm !== 'game') return;
+  const ord = st.ids;
+  let tk = st.tk;
+  if (!tk) tk = st.tk = { ph: 'ask', i: 0, a: ord[0], t: null, u: st.goAt + RULES.ask * 1000, cyc: 1 };
+  const nextTurn = () => {
+    tk.i++; tk.t = null;
+    if (tk.i >= ord.length) { tk.ph = 'disc'; tk.a = null; tk.dn = new Set(); tk.u = now + RULES.disc * 1000; }
+    else { tk.ph = 'ask'; tk.a = ord[tk.i]; tk.u = now + RULES.ask * 1000; }
+  };
+  for (let g = 0; g < 50 && now >= tk.u; g++) {
+    if (tk.ph === 'ask') { if (tk.t) { tk.ph = 'ans'; tk.u = now + RULES.ans * 1000; } else nextTurn(); }
+    else if (tk.ph === 'ans') nextTurn();
+    else { tk.cyc++; tk.i = 0; tk.ph = 'ask'; tk.a = ord[0]; tk.t = null; tk.u = now + RULES.ask * 1000; }
+  }
+}
+function talkAct(room, cid, d) {
+  advance(room);
+  const st = room.started, tk = st && st.tk, now = Date.now();
+  if (!tk || st.result || room.vm !== 'game') return;
+  if (d.t === 'ask' && tk.ph === 'ask' && tk.a === cid) { const v = String(d.v || ''); if (v !== cid && st.ids.indexOf(v) >= 0) tk.t = v; }
+  if (d.t === 'tdone') {
+    if (tk.ph === 'ask' && tk.a === cid && tk.t) { tk.ph = 'ans'; tk.u = now + RULES.ans * 1000; }
+    else if (tk.ph === 'ans' && tk.t === cid) tk.u = now;
+    else if (tk.ph === 'disc') { tk.dn = tk.dn || new Set(); tk.dn.add(cid); if (st.ids.every(x => tk.dn.has(x))) tk.u = now; }
+    else if (tk.ph === 'ask' && tk.a === cid && !tk.t) tk.u = now;
+    advance(room);
+  }
+}
 function stateOf(room, cid, since) {
+  advance(room);
   const st = room.started, now = Date.now();
   return { k: st.seen.size, n: st.ids.length, el: st.goAt ? now - st.goAt : null, nx: room.next || null,
     rd: st.ready.size, rm: st.ready.has(cid), ca: st.startAt ? st.startAt - now : null, sn: st.seen.has(cid),
-    vt: st.votes.size, mine: st.votes.get(cid) || null, round: room.round, rounds: room.rounds, dur: room.dur || 180, lead: room.leader, res: st.result, fx: (st.fx || []).filter(e => e.i > (+since || 0)), fxs: st.fxs || 0 };
+    vt: st.votes.size, mine: st.votes.get(cid) || null, round: room.round, rounds: room.rounds, dur: room.dur || 180, vm: room.vm || 'ext', rv: st.revealAt && !st.goAt ? Math.max(0, st.revealAt - now) : null, tk: st.tk && !st.result ? { ph: st.tk.ph, a: st.tk.a, t: st.tk.t, u: Math.max(0, st.tk.u - now), cyc: st.tk.cyc, dn: st.tk.dn ? st.tk.dn.size : 0, dm: !!(st.tk.dn && st.tk.dn.has(cid)) } : null, lead: room.leader, res: st.result, fx: (st.fx || []).filter(e => e.i > (+since || 0)), fxs: st.fxs || 0 };
 }
 function sendRole(room, cl) {
   const st = room.started;
@@ -73,6 +110,7 @@ function send(res, code, body, extra) {
 const CATALOG = (() => { try { return JSON.parse(require('fs').readFileSync(require('path').join(__dirname, 'catalog.json'), 'utf8')); } catch (e) { console.log('catalog.json missing', e.message); return { stickers: [], sounds: [], frames: [] }; } })();
 const PRICES = new Map();
 for (const k of ['stickers', 'sounds', 'frames']) for (const x of CATALOG[k]) PRICES.set(x.id, x.price | 0);
+const RULES = Object.assign({ reveal: 10, ask: 60, ans: 60, disc: 300, cap: 3600, dur_min: 1, dur_max: 60 }, CATALOG.rules || {});
 const itemPrice = id => PRICES.get(String(id)) || 0;
 // ---- accounts (Supabase REST when SUPA_URL + SUPA_KEY are set, in-memory otherwise) ----
 const SUPA_URL = (process.env.SUPA_URL || '').replace(/\/+$/, ''), SUPA_KEY = process.env.SUPA_KEY || '';
@@ -294,7 +332,7 @@ http.createServer((req, res) => {
     req.on('end', () => {
       let d;
       try { d = JSON.parse(body); } catch (e) { return send(res, 400, 'bad json'); }
-      const TYPES = ['j', 'l', 'reveal', 'seen', 'state', 'again', 'ready', 'vote', 'close', 'vjoin', 'vleave', 'sig', 'sigpoll', 'fx'];
+      const TYPES = ['j', 'l', 'reveal', 'seen', 'state', 'again', 'ready', 'vote', 'close', 'vjoin', 'vleave', 'sig', 'sigpoll', 'fx', 'ask', 'tdone'];
       if (!d || TYPES.indexOf(d.t) < 0 || typeof d.c !== 'string' || !/^[A-Za-z0-9_-]{1,20}$/.test(d.c)) return send(res, 400, 'bad msg');
       let room = rooms.get(code);
       if (!room) {
@@ -302,8 +340,8 @@ http.createServer((req, res) => {
         if (!d.host || d.t !== 'j' || n < 2 || n > 9) return send(res, 404, 'no room');
         if (rooms.size >= MAX_ROOMS || limited('new:' + ip, 20)) return send(res, 429, 'busy');
         const rr = Math.floor(+d.rounds), rounds = Number.isFinite(rr) ? Math.max(1, Math.min(20, rr)) : 3;
-        const dd0 = Math.floor(+d.dur), dur0 = Number.isFinite(dd0) ? Math.max(60, Math.min(900, dd0)) : 180;
-        room = { n, msgs: [], clients: new Set(), roster: [], started: null, t: Date.now(), rounds, dur: dur0, round: 1, leader: String(d.c).slice(0, 20), scores: {} };
+        const dd0 = Math.floor(+d.dur), dur0 = Number.isFinite(dd0) ? Math.max(RULES.dur_min * 60, Math.min(RULES.dur_max * 60, dd0)) : 180;
+        room = { n, msgs: [], clients: new Set(), roster: [], started: null, t: Date.now(), rounds, dur: dur0, vm: d.vm === 'game' ? 'game' : 'ext', round: 1, leader: String(d.c).slice(0, 20), scores: {} };
         rooms.set(code, room);
       }
       delete d.host;
@@ -311,9 +349,11 @@ http.createServer((req, res) => {
       room.t = Date.now();
       const J = { 'Content-Type': 'application/json' };
       const st = room.started;
-      if (['reveal', 'seen', 'state', 'again', 'ready', 'vote', 'close', 'vjoin', 'vleave', 'sig', 'sigpoll', 'fx'].indexOf(d.t) >= 0) {
+      if (['reveal', 'seen', 'state', 'again', 'ready', 'vote', 'close', 'vjoin', 'vleave', 'sig', 'sigpoll', 'fx', 'ask', 'tdone'].indexOf(d.t) >= 0) {
         if (!st || st.ids.indexOf(cid) < 0) return send(res, 403, 'no');
         const now = Date.now();
+        advance(room);
+        if (d.t === 'ask' || d.t === 'tdone') { talkAct(room, cid, d); return send(res, 200, JSON.stringify(stateOf(room, cid, d.s)), J); }
         if (d.t === 'fx') {
           const id = String(d.k || '');
           if (!st.goAt || !/^[sa]/.test(id) || !itemPrice(id)) return send(res, 400, 'bad fx');
@@ -342,11 +382,11 @@ http.createServer((req, res) => {
         }
         if (d.t === 'ready' && !st.startAt) {
           st.ready.add(cid);
-          if (st.ready.size >= st.ids.length) st.startAt = now + 3000;
+          if (st.ready.size >= st.ids.length) { st.startAt = now + 3000; st.revealAt = st.startAt + RULES.reveal * 1000; }
         }
         if (d.t === 'seen' && st.startAt && now >= st.startAt) {
           st.seen.add(cid);
-          if (st.seen.size >= st.ids.length && !st.goAt) st.goAt = now;
+          
         }
         if (d.t === 'vote' && st.goAt && !st.result) {
           const v = String(d.v || '');
@@ -362,7 +402,7 @@ http.createServer((req, res) => {
           for (let tries = 0; tries < 20; tries++) { const c2 = String(cat) + code[1] + String(1000 + crypto.randomInt(1000)).slice(1); if (!rooms.has(c2)) { nc = c2; break; } }
           if (!nc || rooms.size >= MAX_ROOMS) return send(res, 429, 'busy');
           const ids = st.ids.slice();
-          rooms.set(nc, { acct: Object.assign({}, room.acct || {}), n: room.n, msgs: room.msgs.slice(), clients: new Set(), roster: room.roster.slice(), started: Object.assign(newRound(ids), { voice: new Set(st.voice) }), t: now, rounds: room.rounds, dur: room.dur, round: last ? 1 : room.round + 1, leader: room.leader, scores: last ? {} : Object.assign({}, room.scores) });
+          rooms.set(nc, { acct: Object.assign({}, room.acct || {}), n: room.n, msgs: room.msgs.slice(), clients: new Set(), roster: room.roster.slice(), started: Object.assign(newRound(ids), { voice: new Set(st.voice) }), t: now, rounds: room.rounds, dur: room.dur, vm: room.vm, round: last ? 1 : room.round + 1, leader: room.leader, scores: last ? {} : Object.assign({}, room.scores) });
           room.next = nc;
         }
         return send(res, 200, JSON.stringify(stateOf(room, cid, d.s)), J);
