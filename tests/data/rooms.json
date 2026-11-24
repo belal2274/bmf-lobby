@@ -35,22 +35,22 @@
       "name": "at maximum",
       "send": {
         "rounds": 20,
-        "dur": 900
+        "dur": 3600
       },
       "expect": {
         "rounds": 20,
-        "dur": 900
+        "dur": 3600
       }
     },
     {
       "name": "above maximum",
       "send": {
         "rounds": 21,
-        "dur": 901
+        "dur": 3601
       },
       "expect": {
         "rounds": 20,
-        "dur": 900
+        "dur": 3600
       }
     },
     {

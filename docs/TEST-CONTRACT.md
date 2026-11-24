@@ -37,7 +37,7 @@ Claim rules (add):
 - Ownership: the join message may carry `u:<username>`. The server binds that cid to the account for that room (first join of a cid wins, repeat joins are ignored) and the binding carries into next-round rooms. A claim for a cid bound to a different account, or unbound, -> 403 `not your player`. So claim tests must join with `u` equal to the claiming account.
 - Consumption is global per (room, round, cid): once claimed, nobody else can claim it (409).
 
-Room endpoints (room code in the path, JSON body with `t`): join `j` (host creates), `ready`, `vote`, `state`, `fx`, etc. Room create (host join only): n 2..9 else 404; rounds = floor, clamped 1..20, non-numeric -> 3; dur seconds clamped 60..900, non-numeric -> 180. Sent only in the host's first join, ignored afterwards. Next-round rooms keep rounds and dur.
+Room endpoints (room code in the path, JSON body with `t`): join `j` (host creates), `ready`, `vote`, `state`, `fx`, etc. Room create (host join only): n 2..9 else 404; rounds = floor, clamped 1..20, non-numeric -> 3; dur seconds clamped 60..3600, non-numeric -> 180. Sent only in the host's first join, ignored afterwards. Next-round rooms keep rounds and dur.
 - fx `{t:'fx',k,s}`: id must start with s or a and exist in catalog, round must have started (goAt set) else 400; sender must be in the round else 403.
 
 ## 3. Cooldown (fx)
@@ -47,7 +47,7 @@ Room endpoints (room code in the path, JSON body with `t`): join `j` (host creat
 - Stored for the 30 most recent events, kept 30 s.
 
 ## 4. Settings boundaries
-Numeric out-of-range values are clamped (rounds 0 -> 1, dur 0 -> 60; 99 -> 20, 5000 -> 900). Non-integers are floored. Missing or non-numeric values use the defaults (rounds 3, dur 180). After the room exists the host values are ignored.
+Numeric out-of-range values are clamped (rounds 0 -> 1, dur 0 -> 60; 99 -> 20, 5000 -> 3600). Non-integers are floored. Missing or non-numeric values use the defaults (rounds 3, dur 180). After the room exists the host values are ignored.
 
 ## 5. Room protocol, exact shapes
 Base: `POST /r/<code>` with a JSON body, `Content-Type` any. `<code>` = 5 digits: digit 1 = category (1..9), digit 2 = player count n (2..9), digits 3-5 any (e.g. `13123` = category 1, 3 players). Rate limit 1500 req/min per IP. Body max 4096 bytes. Every body needs `t` (string) and `c` (string cid, max 20 chars, your client id, one per player). Errors are plain text.

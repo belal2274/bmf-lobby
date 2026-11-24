@@ -76,6 +76,13 @@ async function startClock(base, room) {
   const ca = (last.json && last.json.ca) || 3000;
   await sleep(ca + 200);
   for (const c of room.cids) await post(base, room.code, { t: 'seen', c });
+  // The server now has a fixed reveal period (rules.reveal, 10 s) before play starts: wait until the clock runs (state.el set).
+  for (let i = 0; i < 80; i++) {
+    const r = await post(base, room.code, { t: 'state', c: room.cids[0], s: 0 });
+    if (r.json && r.json.el !== null && r.json.el !== undefined) return;
+    await sleep(250);
+  }
+  throw new Error('round clock did not start after the reveal period');
 }
 
 const state = (base, room, c = room.leader, s = 0) => post(base, room.code, { t: 'state', c, s });
