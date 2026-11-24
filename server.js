@@ -51,11 +51,11 @@ function resolve(room) {
   if (room.round >= room.rounds) { const mx = Math.max.apply(null, st.ids.map(id => tot[id])); win = st.ids.filter(id => tot[id] === mx); }
   st.result = { win, bonus: win.length ? Math.floor(10 / win.length) : 0, imp: st.imp, r: st.r, votes, d, tot, disc, round: room.round, rounds: room.rounds, at: Date.now() };
 }
-function stateOf(room, cid) {
+function stateOf(room, cid, since) {
   const st = room.started, now = Date.now();
   return { k: st.seen.size, n: st.ids.length, el: st.goAt ? now - st.goAt : null, nx: room.next || null,
     rd: st.ready.size, rm: st.ready.has(cid), ca: st.startAt ? st.startAt - now : null, sn: st.seen.has(cid),
-    vt: st.votes.size, mine: st.votes.get(cid) || null, round: room.round, rounds: room.rounds, lead: room.leader, res: st.result };
+    vt: st.votes.size, mine: st.votes.get(cid) || null, round: room.round, rounds: room.rounds, lead: room.leader, res: st.result, fx: (st.fx || []).filter(e => e.i > (+since || 0)), fxs: st.fxs || 0 };
 }
 function sendRole(room, cl) {
   const st = room.started;
@@ -68,6 +68,9 @@ function send(res, code, body, extra) {
   res.end(body);
 }
 
+// ---- store catalog: stickers s1..sN cost 10, sounds a1..aM cost 5 ----
+const STK = 15, SND = 3;
+const itemPrice = id => { const m = /^([sa])(\d{1,3})$/.exec(String(id)); if (!m) return 0; const n = +m[2]; if (m[1] === 's') return n >= 1 && n <= STK ? 10 : 0; return n >= 1 && n <= SND ? 5 : 0; };
 // ---- accounts (Supabase REST when SUPA_URL + SUPA_KEY are set, in-memory otherwise) ----
 const SUPA_URL = (process.env.SUPA_URL || '').replace(/\/+$/, ''), SUPA_KEY = process.env.SUPA_KEY || '';
 const memAcc = new Map();
@@ -86,7 +89,7 @@ async function accGet(u) {
 async function accPut(row, create) {
   if (!SUPA_URL) { memAcc.set(row.username, Object.assign({}, row)); return; }
   if (create) await dbFetch('accounts', { method: 'POST', body: JSON.stringify(row) });
-  else await dbFetch('accounts?username=eq.' + encodeURIComponent(row.username), { method: 'PATCH', body: JSON.stringify({ tok: row.tok, pts: row.pts, rids: row.rids }) });
+  else await dbFetch('accounts?username=eq.' + encodeURIComponent(row.username), { method: 'PATCH', body: JSON.stringify({ tok: row.tok, pts: row.pts, rids: row.rids, items: row.items || '' }) });
 }
 const sha = s => crypto.createHash('sha256').update(s).digest('hex');
 const accQ = new Map(); // serialize per user so two phones cannot race
@@ -106,9 +109,10 @@ async function accHandle(d) {
       if (await accGet(u)) return [409, 'الاسم ده مأخوذ'];
       const salt = crypto.randomBytes(16).toString('hex'), hash = crypto.scryptSync(p, salt, 32).toString('hex');
       const tok = crypto.randomBytes(24).toString('hex');
+      const its = String(d.items || '').split(',').filter((x, i, a) => itemPrice(x) > 0 && a.indexOf(x) === i).join(',');
       let pts = Math.floor(+d.init) || 0; pts = Math.max(-9, Math.min(500, pts));
-      await accPut({ username: u, salt, hash, tok: sha(tok), pts, rids: [] }, true);
-      return [200, { tok, pts }];
+      await accPut({ username: u, salt, hash, tok: sha(tok), pts, rids: [], items: its }, true);
+      return [200, { tok, pts, items: its }];
     }
     const a = await accGet(u);
     if (t === 'login') {
@@ -117,10 +121,19 @@ async function accHandle(d) {
       if (!crypto.timingSafeEqual(Buffer.from(h), Buffer.from(a.hash))) return [403, 'الاسم أو كلمة السر غلط'];
       const tok = crypto.randomBytes(24).toString('hex');
       a.tok = sha(tok); await accPut(a, false);
-      return [200, { tok, pts: a.pts }];
+      return [200, { tok, pts: a.pts, items: a.items || '' }];
     }
     if (!a || a.tok !== sha(String(d.tok || ''))) return [403, 'سجل دخول تاني'];
-    if (t === 'get') return [200, { pts: a.pts }];
+    if (t === 'get') return [200, { pts: a.pts, items: a.items || '' }];
+    if (t === 'buy') {
+      const id = String(d.item || ''), price = itemPrice(id), own = String(a.items || '').split(',').filter(Boolean);
+      if (!price) return [400, 'الحاجة دي مش موجودة'];
+      if (own.indexOf(id) >= 0) return [200, { pts: a.pts, items: own.join(','), dup: true }];
+      if (a.pts < price) return [402, 'نقطك مش كفاية'];
+      a.pts -= price; own.push(id); a.items = own.join(',');
+      await accPut(a, false);
+      return [200, { pts: a.pts, items: a.items }];
+    }
     if (t === 'add') {
       const rid = String(d.rid || '').slice(0, 40);
       const dd = Math.max(-60, Math.min(60, Math.floor(+d.d) || 0)), bb = Math.max(0, Math.min(10, Math.floor(+d.b) || 0));
@@ -150,7 +163,7 @@ http.createServer((req, res) => {
     req.on('data', c => { body += c; if (body.length > 2000) req.destroy(); });
     req.on('end', () => {
       let d; try { d = JSON.parse(body); } catch (e) { return send(res, 400, 'bad json'); }
-      if (!d || ['signup', 'login', 'get', 'add'].indexOf(d.t) < 0) return send(res, 400, 'bad msg');
+      if (!d || ['signup', 'login', 'get', 'add', 'buy'].indexOf(d.t) < 0) return send(res, 400, 'bad msg');
       accHandle(d).then(r => send(res, r[0], typeof r[1] === 'string' ? r[1] : JSON.stringify(r[1]), typeof r[1] === 'string' ? {} : { 'Content-Type': 'application/json' }))
         .catch(e => { console.log('acc error', e.message); send(res, 500, 'خطأ في السيرفر'); });
     });
@@ -243,7 +256,7 @@ http.createServer((req, res) => {
     req.on('end', () => {
       let d;
       try { d = JSON.parse(body); } catch (e) { return send(res, 400, 'bad json'); }
-      const TYPES = ['j', 'l', 'reveal', 'seen', 'state', 'again', 'ready', 'vote', 'close', 'vjoin', 'vleave', 'sig', 'sigpoll'];
+      const TYPES = ['j', 'l', 'reveal', 'seen', 'state', 'again', 'ready', 'vote', 'close', 'vjoin', 'vleave', 'sig', 'sigpoll', 'fx'];
       if (!d || TYPES.indexOf(d.t) < 0 || typeof d.c !== 'string') return send(res, 400, 'bad msg');
       let room = rooms.get(code);
       if (!room) {
@@ -259,9 +272,19 @@ http.createServer((req, res) => {
       room.t = Date.now();
       const J = { 'Content-Type': 'application/json' };
       const st = room.started;
-      if (['reveal', 'seen', 'state', 'again', 'ready', 'vote', 'close', 'vjoin', 'vleave', 'sig', 'sigpoll'].indexOf(d.t) >= 0) {
+      if (['reveal', 'seen', 'state', 'again', 'ready', 'vote', 'close', 'vjoin', 'vleave', 'sig', 'sigpoll', 'fx'].indexOf(d.t) >= 0) {
         if (!st || st.ids.indexOf(cid) < 0) return send(res, 403, 'no');
         const now = Date.now();
+        if (d.t === 'fx') {
+          const id = String(d.k || '');
+          if (!st.goAt || !itemPrice(id)) return send(res, 400, 'bad fx');
+          st.fxT = st.fxT || new Map(); st.fx = st.fx || []; st.fxs = st.fxs || 0;
+          if (now - (st.fxT.get(cid) || 0) < 3000) return send(res, 429, 'wait');
+          st.fxT.set(cid, now); st.fxs++;
+          st.fx.push({ i: st.fxs, f: cid, k: id, t: now });
+          st.fx = st.fx.filter(e => now - e.t < 30000).slice(-30);
+          return send(res, 200, JSON.stringify(stateOf(room, cid, d.s)), J);
+        }
         if (d.t === 'vjoin') { st.voice.add(cid); return send(res, 200, JSON.stringify({ vc: [...st.voice] }), J); }
         if (d.t === 'vleave') { st.voice.delete(cid); st.mail.delete(cid); return send(res, 200, JSON.stringify({ vc: [...st.voice] }), J); }
         if (d.t === 'sig') {
@@ -303,7 +326,7 @@ http.createServer((req, res) => {
           rooms.set(nc, { n: room.n, msgs: room.msgs.slice(), clients: new Set(), roster: room.roster.slice(), started: Object.assign(newRound(ids), { voice: new Set(st.voice) }), t: now, rounds: room.rounds, round: last ? 1 : room.round + 1, leader: room.leader, scores: last ? {} : Object.assign({}, room.scores) });
           room.next = nc;
         }
-        return send(res, 200, JSON.stringify(stateOf(room, cid)), J);
+        return send(res, 200, JSON.stringify(stateOf(room, cid, d.s)), J);
       }
       if (room.started) return send(res, 200, 'ok');
       if (d.t === 'l') {
