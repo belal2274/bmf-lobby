@@ -93,7 +93,7 @@ function stateOf(room, cid, since) {
   const st = room.started, now = Date.now();
   return { k: st.seen.size, n: st.ids.length, el: st.goAt ? now - st.goAt : null, nx: room.next || null,
     rd: st.ready.size, rm: st.ready.has(cid), ca: st.startAt ? st.startAt - now : null, sn: st.seen.has(cid),
-    vt: st.votes.size, mine: st.votes.get(cid) || null, round: room.round, rounds: room.rounds, dur: room.dur || 180, vm: room.vm || 'ext', rv: st.revealAt && !st.goAt ? Math.max(0, st.revealAt - now) : null, tk: st.tk && !st.result ? { ph: st.tk.ph, a: st.tk.a, t: st.tk.t, u: Math.max(0, st.tk.u - now), cyc: st.tk.cyc, dn: st.tk.ph === 'disc' && st.tk.dn ? st.tk.dn.size : 0, dm: !!(st.tk.ph === 'disc' && st.tk.dn && st.tk.dn.has(cid)) } : null, lead: room.leader, res: st.result, fx: (st.fx || []).filter(e => e.i > (+since || 0)), fxs: st.fxs || 0 };
+    vt: st.votes.size, mine: st.votes.get(cid) || null, round: room.round, rounds: room.rounds, dur: room.dur || 180, vm: room.vm || 'ext', rv: st.revealAt && !st.goAt ? Math.max(0, st.revealAt - now) : null, tk: st.tk && !st.result ? { ph: st.tk.ph, a: st.tk.a, t: st.tk.t, u: Math.max(0, st.tk.u - now), cyc: st.tk.cyc, dn: st.tk.ph === 'disc' && st.tk.dn ? st.tk.dn.size : 0, dm: !!(st.tk.ph === 'disc' && st.tk.dn && st.tk.dn.has(cid)) } : null, lead: room.leader, res: st.result, fx: (st.fx || []).filter(e => e.i > (+since || 0) && !(ADULT.has(e.k) && room.fam && room.fam.has(cid))), fxs: st.fxs || 0 };
 }
 function sendRole(room, cl) {
   const st = room.started;
@@ -112,6 +112,7 @@ const PRICES = new Map();
 for (const k of ['stickers', 'sounds', 'frames']) for (const x of CATALOG[k]) PRICES.set(x.id, x.price | 0);
 const RULES = Object.assign({ reveal: 10, ask: 60, ans: 60, disc: 300, cap: 3600, dur_min: 1, dur_max: 60 }, CATALOG.rules || {});
 const itemPrice = id => PRICES.get(String(id)) || 0;
+const ADULT = new Set((CATALOG.stickers || []).filter(x => x.adult).map(x => x.id)); // regular edition only
 // ---- accounts (Supabase REST when SUPA_URL + SUPA_KEY are set, in-memory otherwise) ----
 const SUPA_URL = (process.env.SUPA_URL || '').replace(/\/+$/, ''), SUPA_KEY = process.env.SUPA_KEY || '';
 const memAcc = new Map();
@@ -384,6 +385,7 @@ http.createServer((req, res) => {
         if (d.t === 'fx') {
           const id = String(d.k || '');
           if (!st.goAt || !/^[sa]/.test(id) || !itemPrice(id)) return send(res, 400, 'bad fx');
+          if (ADULT.has(id) && room.fam && room.fam.has(cid)) return send(res, 400, 'bad fx');
           st.fxT = st.fxT || new Map(); st.fx = st.fx || []; st.fxs = st.fxs || 0;
           if (now - (st.fxT.get(cid) || 0) < 3000) return send(res, 429, 'wait');
           st.fxT.set(cid, now); st.fxs++;
@@ -429,7 +431,7 @@ http.createServer((req, res) => {
           for (let tries = 0; tries < 20; tries++) { const c2 = String(cat) + code[1] + String(1000 + crypto.randomInt(1000)).slice(1); if (!rooms.has(c2)) { nc = c2; break; } }
           if (!nc || rooms.size >= MAX_ROOMS) return send(res, 429, 'busy');
           const ids = st.ids.slice();
-          rooms.set(nc, { acct: Object.assign({}, room.acct || {}), n: room.n, msgs: room.msgs.slice(), clients: new Set(), roster: room.roster.slice(), started: Object.assign(newRound(ids), { voice: new Set(st.voice) }), t: now, rounds: room.rounds, dur: room.dur, vm: room.vm, round: last ? 1 : room.round + 1, leader: room.leader, scores: last ? {} : Object.assign({}, room.scores) });
+          rooms.set(nc, { fam: new Set(room.fam || []), acct: Object.assign({}, room.acct || {}), n: room.n, msgs: room.msgs.slice(), clients: new Set(), roster: room.roster.slice(), started: Object.assign(newRound(ids), { voice: new Set(st.voice) }), t: now, rounds: room.rounds, dur: room.dur, vm: room.vm, round: last ? 1 : room.round + 1, leader: room.leader, scores: last ? {} : Object.assign({}, room.scores) });
           room.next = nc;
         }
         return send(res, 200, JSON.stringify(stateOf(room, cid, d.s)), J);
@@ -441,6 +443,7 @@ http.createServer((req, res) => {
       } else {
         if (room.roster.indexOf(cid) >= 0 || room.roster.length >= room.n) return send(res, 200, 'ok');
         room.roster.push(cid);
+        if (d.v === 'fam') { room.fam = room.fam || new Set(); room.fam.add(cid); }
         { const un = String(d.u || '').trim().toLowerCase(); if (/^[a-z0-9_\u0600-\u06ff]{3,20}$/.test(un)) { room.acct = room.acct || {}; room.acct[cid] = un; } }
       }
       const s = JSON.stringify({ t: d.t, v: d.v === 'fam' ? 'fam' : 'full', c: cid, n: String(d.n || '').slice(0, 14), f: /^f\d{1,2}$/.test(String(d.f || '')) ? String(d.f) : '', a: String(d.a || '').slice(0, 4000) });
