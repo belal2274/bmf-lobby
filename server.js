@@ -24,11 +24,21 @@ function limited(ip, max) {
   return ++h.n > max;
 }
 
+// Impostor's final guess from ~10 choices (built by a knower's app). 2 players: right +5, wrong/none -2 (replaces the vote scoring). 3+: right +3, wrong/none -2 on top of the normal scoring.
+const G2_WIN = 5, G2_LOSE = -2, G3_WIN = 3, G3_LOSE = -2, G2_GRACE = 90, G3_GRACE = 45;
 const IMP_MIN = 5; // undiscovered impostor: room under 5 players = 5 points; 5 or more = number of players who did not pick them
 function newRound(ids) {
   return { ids, imp: ids[crypto.randomInt(ids.length)], r: crypto.randomInt(2147483647), seen: new Set(), ready: new Set(), startAt: 0, goAt: 0, votes: new Map(), result: null, voice: new Set(), mail: new Map() };
 }
 function resolve(room) {
+  const st0 = room.started;
+  if (st0 && st0.ids.length > 2 && !st0.result) { // 3+ players: after the votes the impostor gets one last guess (10 choices)
+    if (st0.gwait) return;
+    if (st0.g2 && st0.g2.opts && st0.g2.pick == null) { st0.gwait = Date.now(); return; }
+  }
+  resolveFinal(room);
+}
+function resolveFinal(room) {
   const st = room.started;
   const tally = {}; for (const id of st.ids) tally[id] = 0;
   for (const v of st.votes.values()) tally[v]++;
@@ -36,8 +46,10 @@ function resolve(room) {
   const disc = tally[st.imp] > 0 && tally[st.imp] === top && st.ids.filter(id => tally[id] === top).length === 1;
   const d = {};
   for (const id of st.ids) d[id] = 0;
+  const two = st.ids.length === 2;
   const others = st.ids.length - 1;
   let picks = 0;
+  if (two) { d[st.imp] = (st.g2 && st.g2.ok === true) ? G2_WIN : G2_LOSE; } else {
   for (const id of st.ids) {
     if (id === st.imp) continue;
     const tgt = st.votes.get(id);
@@ -46,12 +58,14 @@ function resolve(room) {
   const nonPick = others - picks;
   if (st.ids.length >= 5) d[st.imp] = nonPick - picks;
   else d[st.imp] = (picks === others ? 0 : IMP_MIN) - picks;
+  }
+  if (!two && st.g2 && st.g2.opts) d[st.imp] += st.g2.ok === true ? G3_WIN : G3_LOSE; // last guess: right +3, wrong or none -2
   const tot = {};
   for (const id of st.ids) { room.scores[id] = (room.scores[id] || 0) + d[id]; tot[id] = room.scores[id]; }
   const votes = {}; for (const [a, b] of st.votes) votes[a] = b;
   let win = [];
   if (room.round >= room.rounds) { const mx = Math.max.apply(null, st.ids.map(id => tot[id])); win = st.ids.filter(id => tot[id] === mx); }
-  st.result = { win, bonus: win.length ? Math.floor(10 / win.length) : 0, imp: st.imp, r: st.r, votes, d, tot, disc, round: room.round, rounds: room.rounds, at: Date.now() };
+  st.result = { win, bonus: win.length ? Math.floor(10 / win.length) : 0, imp: st.imp, r: st.r, votes, d, tot, disc: two ? !(st.g2 && st.g2.ok === true) : disc, g2: (st.g2 && st.g2.opts) ? { two, ok: st.g2.ok === true, pick: st.g2.pick != null ? st.g2.opts[st.g2.pick] : null, real: st.g2.opts[st.g2.k] } : (two ? { two, ok: false, pick: null, real: null } : null), round: room.round, rounds: room.rounds, at: Date.now() };
   room.hist = room.hist || {}; room.hist[room.round] = { d, win: win.slice(), bonus: st.result.bonus, ids: st.ids.slice() };
 }
 const ABSENT_MS = 45000;
@@ -60,7 +74,9 @@ function advance(room) {
   if (!st || st.result) return;
   if (!st.goAt && st.revealAt && now >= st.revealAt) st.goAt = st.revealAt;
   if (!st.goAt) return;
+  if (st.gwait) { if (now - st.gwait > G3_GRACE * 1000) resolveFinal(room); return; }
   if (now - st.goAt > RULES.cap * 1000) { resolve(room); return; }
+  if (st.ids.length === 2 && room.vm !== 'game' && now - st.goAt > ((room.dur || 180) + G2_GRACE) * 1000) { resolveFinal(room); return; }
   // a player who left (no contact for ABSENT_MS) keeps their seat but is not waited for when voting
   if (st.votes.size > 0 && st.ids.every(id => id === st.imp || st.votes.has(id) || now - ((st.pres && st.pres[id]) || st.goAt) > ABSENT_MS)) { resolve(room); return; }
   if (room.vm !== 'game') return;
@@ -97,7 +113,7 @@ function stateOf(room, cid, since) {
   const st = room.started, now = Date.now();
   return { k: st.seen.size, n: st.ids.length, el: st.goAt ? now - st.goAt : null, nx: room.next || null,
     rd: st.ready.size, rm: st.ready.has(cid), ca: st.startAt ? st.startAt - now : null, sn: st.seen.has(cid),
-    vt: st.votes.size, mine: st.votes.get(cid) || null, round: room.round, rounds: room.rounds, dur: room.dur || 180, vm: room.vm || 'ext', rv: st.revealAt && !st.goAt ? Math.max(0, st.revealAt - now) : null, tk: st.tk && !st.result ? { ph: st.tk.ph, a: st.tk.a, t: st.tk.t, u: Math.max(0, st.tk.u - now), cyc: st.tk.cyc, dn: st.tk.ph === 'disc' && st.tk.dn ? st.tk.dn.size : 0, dm: !!(st.tk.ph === 'disc' && st.tk.dn && st.tk.dn.has(cid)) } : null, lead: room.leader, res: st.result, fx: (st.fx || []).filter(e => e.i > (+since || 0) && !(ADULT.has(e.k) && room.fam && room.fam.has(cid))), fxs: st.fxs || 0 };
+    g2: { opts: (st.g2 && st.g2.opts) || null, gw: st.gwait ? Math.max(0, st.gwait + G3_GRACE * 1000 - now) : null }, vt: st.votes.size, mine: st.votes.get(cid) || null, round: room.round, rounds: room.rounds, dur: room.dur || 180, vm: room.vm || 'ext', rv: st.revealAt && !st.goAt ? Math.max(0, st.revealAt - now) : null, tk: st.tk && !st.result ? { ph: st.tk.ph, a: st.tk.a, t: st.tk.t, u: Math.max(0, st.tk.u - now), cyc: st.tk.cyc, dn: st.tk.ph === 'disc' && st.tk.dn ? st.tk.dn.size : 0, dm: !!(st.tk.ph === 'disc' && st.tk.dn && st.tk.dn.has(cid)) } : null, lead: room.leader, res: st.result, fx: (st.fx || []).filter(e => e.i > (+since || 0) && !(ADULT.has(e.k) && room.fam && room.fam.has(cid))), fxs: st.fxs || 0 };
 }
 function sendRole(room, cl) {
   const st = room.started;
@@ -371,7 +387,7 @@ http.createServer((req, res) => {
     req.on('end', () => {
       let d;
       try { d = JSON.parse(body); } catch (e) { return send(res, 400, 'bad json'); }
-      const TYPES = ['j', 'l', 'reveal', 'seen', 'state', 'again', 'ready', 'vote', 'close', 'vjoin', 'vleave', 'sig', 'sigpoll', 'fx', 'ask', 'tdone'];
+      const TYPES = ['j', 'l', 'reveal', 'seen', 'state', 'again', 'ready', 'vote', 'close', 'vjoin', 'vleave', 'sig', 'sigpoll', 'fx', 'ask', 'tdone', 'opts', 'pick'];
       if (!d || TYPES.indexOf(d.t) < 0 || typeof d.c !== 'string' || !/^[A-Za-z0-9_-]{1,20}$/.test(d.c)) return send(res, 400, 'bad msg');
       let room = rooms.get(code);
       if (!room) {
@@ -390,7 +406,7 @@ http.createServer((req, res) => {
       const J = { 'Content-Type': 'application/json' };
       const st = room.started;
       if (st && st.ids.indexOf(cid) >= 0) { st.pres = st.pres || {}; st.pres[cid] = Date.now(); }
-      if (['reveal', 'seen', 'state', 'again', 'ready', 'vote', 'close', 'vjoin', 'vleave', 'sig', 'sigpoll', 'fx', 'ask', 'tdone'].indexOf(d.t) >= 0) {
+      if (['reveal', 'seen', 'state', 'again', 'ready', 'vote', 'close', 'vjoin', 'vleave', 'sig', 'sigpoll', 'fx', 'ask', 'tdone', 'opts', 'pick'].indexOf(d.t) >= 0) {
         if (!st || st.ids.indexOf(cid) < 0) return send(res, 403, 'no');
         const now = Date.now();
         advance(room);
@@ -433,13 +449,24 @@ http.createServer((req, res) => {
           st.seen.add(cid);
           
         }
-        if (d.t === 'vote' && st.goAt && !st.result) {
+        if ((d.t === 'opts' || d.t === 'pick') && !st.result) {
+          const g = st.g2 = st.g2 || { opts: null, k: null, pick: null, ok: null };
+          if (d.t === 'opts' && cid !== st.imp && !g.opts && Array.isArray(d.w)) {
+            const w = d.w.slice(0, 12).map(x => String(x == null ? '' : x).replace(/\s+/g, ' ').trim().slice(0, 40));
+            const k = Math.floor(+d.k);
+            if (w.length >= 4 && w.every(x => x) && new Set(w).size === w.length && Number.isFinite(k) && k >= 0 && k < w.length) { g.opts = w; g.k = k; }
+          } else if (d.t === 'pick' && cid === st.imp && st.goAt && g.opts && g.pick == null && (st.ids.length === 2 || st.gwait)) {
+            const i = Math.floor(+d.i);
+            if (Number.isFinite(i) && i >= 0 && i < g.opts.length) { g.pick = i; g.ok = i === g.k; resolveFinal(room); }
+          }
+        }
+        if (d.t === 'vote' && st.goAt && !st.result && !st.gwait && st.ids.length !== 2) {
           const v = String(d.v || '');
           if (v !== cid && st.ids.indexOf(v) >= 0) st.votes.set(cid, v);
           advance(room);
           if (!st.result && st.ids.every(id => id === st.imp || st.votes.has(id))) resolve(room);
         }
-        if (d.t === 'close' && st.goAt && !st.result && cid === room.leader) resolve(room);
+        if (d.t === 'close' && st.goAt && !st.result && cid === room.leader) { if (st.ids.length === 2) resolveFinal(room); else resolve(room); }
         if (d.t === 'again' && st.result && !room.next && (cid === room.leader || now - st.result.at > 120000)) {
           const last = room.round >= room.rounds;
           if (last && !d.ng) return send(res, 400, 'finished');
