@@ -115,7 +115,7 @@ const PRICES = new Map();
 for (const k of ['stickers', 'sounds', 'frames']) for (const x of CATALOG[k]) PRICES.set(x.id, x.price | 0);
 const RULES = Object.assign({ reveal: 10, ask: 60, ans: 60, disc: 300, cap: 3600, dur_min: 1, dur_max: 60 }, CATALOG.rules || {});
 const itemPrice = id => PRICES.get(String(id)) || 0;
-const ADULT = new Set((CATALOG.stickers || []).filter(x => x.adult).map(x => x.id)); // regular edition only
+const ADULT = new Set((CATALOG.stickers || []).concat(CATALOG.sounds || []).filter(x => x.adult).map(x => x.id)); // regular edition only
 // ---- accounts (Supabase REST when SUPA_URL + SUPA_KEY are set, in-memory otherwise) ----
 const SUPA_URL = (process.env.SUPA_URL || '').replace(/\/+$/, ''), SUPA_KEY = process.env.SUPA_KEY || '';
 const memAcc = new Map();
