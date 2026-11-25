@@ -37,7 +37,7 @@ Claim rules (add):
 - Ownership: the join message may carry `u:<username>`. The server binds that cid to the account for that room (first join of a cid wins, repeat joins are ignored) and the binding carries into next-round rooms. A claim for a cid bound to a different account, or unbound, -> 403 `not your player`. So claim tests must join with `u` equal to the claiming account.
 - Consumption is global per (room, round, cid): once claimed, nobody else can claim it (409).
 
-Room endpoints (room code in the path, JSON body with `t`): join `j` (host creates), `ready`, `vote`, `state`, `fx`, etc. Room create (host join only): n 2..9 else 404; rounds = floor, clamped 1..20, non-numeric -> 3; dur seconds clamped 60..900, non-numeric -> 180. Sent only in the host's first join, ignored afterwards. Next-round rooms keep rounds and dur.
+Room endpoints (room code in the path, JSON body with `t`): join `j` (host creates), `ready`, `vote`, `state`, `fx`, etc. Room create (host join only): n 2..9 else 404; rounds = floor, clamped 1..20, non-numeric -> 3; dur seconds clamped 60..3600, non-numeric -> 180. Sent only in the host's first join, ignored afterwards. Next-round rooms keep rounds and dur.
 - fx `{t:'fx',k,s}`: id must start with s or a and exist in catalog, round must have started (goAt set) else 400; sender must be in the round else 403.
 
 ## 3. Cooldown (fx)
@@ -47,7 +47,7 @@ Room endpoints (room code in the path, JSON body with `t`): join `j` (host creat
 - Stored for the 30 most recent events, kept 30 s.
 
 ## 4. Settings boundaries
-Numeric out-of-range values are clamped (rounds 0 -> 1, dur 0 -> 60; 99 -> 20, 5000 -> 900). Non-integers are floored. Missing or non-numeric values use the defaults (rounds 3, dur 180). After the room exists the host values are ignored.
+Numeric out-of-range values are clamped (rounds 0 -> 1, dur 0 -> 60; 99 -> 20, 5000 -> 3600). Non-integers are floored. Missing or non-numeric values use the defaults (rounds 3, dur 180). After the room exists the host values are ignored.
 
 ## 5. Room protocol, exact shapes
 Base: `POST /r/<code>` with a JSON body, `Content-Type` any. `<code>` = 5 digits: digit 1 = category (1..9), digit 2 = player count n (2..9), digits 3-5 any (e.g. `13123` = category 1, 3 players). Rate limit 1500 req/min per IP. Body max 4096 bytes. Every body needs `t` (string) and `c` (string cid, max 20 chars, your client id, one per player). Errors are plain text.
@@ -87,3 +87,20 @@ Claim key is (room, round, cid). Different accounts, or different cids, or diffe
 ### Safe items for purchase tests (from catalog.json, current prices)
 Sticker `s1` = 10, sound `a1` = 5, frame `k1` = 10. Signup with `init:40` gives a 40 coin balance (init is capped 0..40).
 Expected: buy s1 -> pts 30; buy a1 -> 25; buy k1 -> 15; repeat any -> 200 `dup:true`, no charge; unknown id -> 400; balance below price -> 402. Read prices from catalog.json in tests rather than hardcoding them.
+
+### Reveal and voice mode (new)
+Round start: all ready -> `ca` 3 s countdown -> role shown 10 s to everyone (`rv` ms left) -> play (`el` set). The old "everyone pressed seen" gate is gone; `seen` is still accepted and ignored.
+Create with `vm:'game'|'ext'` in the host join. `dur` clamps 60..3600 s. See DEV-NOTES "Voice mode" for `tk`, `ask`, `tdone`.
+
+### Voice mode contract (vm='game')
+State fields (stateOf): `vm` 'ext'|'game'; `rv` ms left of the 10 s reveal (null otherwise); `tk` (null in ext mode, before play, and after the result) = `{ph:'ask'|'ans'|'disc', a, t, u, cyc, dn, dm}`:
+- `a` = cid of the asker (null in `disc`). Tests must read it from `tk.a`; do not assume roster order.
+- `t` = cid of the chosen target, `null` when unset (also null in `disc`).
+- `u` = ms left in this phase. `cyc` starts at 1 and goes up by 1 on each new ask cycle. `dn` = number of players done in `disc` (0 in other phases). `dm` = true when the requesting cid is already done.
+Messages (always 200 with the current state JSON, never an error; invalid ones change nothing):
+- `{t:'ask', c, v}`: only the current asker in phase `ask`, target must be another cid in the roster. A repeated valid ask replaces the target until `tdone`. Ignored: non-asker, self, unknown cid, phase `ans`/`disc`, ext mode, after the result.
+- `{t:'tdone', c}`: asker with a target in `ask` -> `ans`. Asker without a target in `ask` -> skips to the next asker. Target in `ans` -> next asker (the asker cannot end the answer). Any player in `disc` marks done; when every player is done -> next cycle (`cyc`+1, first asker again). Uninvolved player in `ask`/`ans`, ext mode: ignored.
+Timing is real time from `rules` in catalog.json: ask 60, ans 60, disc 300 (all mics), cap 3600 (round auto-resolves). Phases also advance when time runs out (no target at expiry -> skip). There is no separate 15 s skip. A target that left is not detected: that answer phase simply runs to its timeout. Votes are accepted in every phase and finish the round as usual. `dur` is still stored and returned in state in game mode but does not end the round; only votes, leader close or the cap do.
+Testing real expiry: copy server.js and catalog.json to a temp dir with shortened `rules` (e.g. reveal 1, ask 2, ans 2, disc 3, cap 8) and start that copy. The server reads catalog.json from its own directory, so no code change is needed. Mic gating is client-side only and is not testable at server level.
+
+Clarification: `tk.dn` and `tk.dm` are 0/false outside the discussion phase and reset when a new ask cycle starts (fixed on dev; earlier builds kept the count).
