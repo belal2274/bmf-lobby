@@ -54,12 +54,15 @@ function resolve(room) {
   st.result = { win, bonus: win.length ? Math.floor(10 / win.length) : 0, imp: st.imp, r: st.r, votes, d, tot, disc, round: room.round, rounds: room.rounds, at: Date.now() };
   room.hist = room.hist || {}; room.hist[room.round] = { d, win: win.slice(), bonus: st.result.bonus, ids: st.ids.slice() };
 }
+const ABSENT_MS = 45000;
 function advance(room) {
   const st = room.started, now = Date.now();
   if (!st || st.result) return;
   if (!st.goAt && st.revealAt && now >= st.revealAt) st.goAt = st.revealAt;
   if (!st.goAt) return;
   if (now - st.goAt > RULES.cap * 1000) { resolve(room); return; }
+  // a player who left (no contact for ABSENT_MS) keeps their seat but is not waited for when voting
+  if (st.votes.size > 0 && st.ids.every(id => id === st.imp || st.votes.has(id) || now - ((st.pres && st.pres[id]) || st.goAt) > ABSENT_MS)) { resolve(room); return; }
   if (room.vm !== 'game') return;
   const ord = st.ids;
   let tk = st.tk;
@@ -377,6 +380,7 @@ http.createServer((req, res) => {
       room.t = Date.now();
       const J = { 'Content-Type': 'application/json' };
       const st = room.started;
+      if (st && st.ids.indexOf(cid) >= 0) { st.pres = st.pres || {}; st.pres[cid] = Date.now(); }
       if (['reveal', 'seen', 'state', 'again', 'ready', 'vote', 'close', 'vjoin', 'vleave', 'sig', 'sigpoll', 'fx', 'ask', 'tdone'].indexOf(d.t) >= 0) {
         if (!st || st.ids.indexOf(cid) < 0) return send(res, 403, 'no');
         const now = Date.now();
@@ -420,7 +424,8 @@ http.createServer((req, res) => {
         if (d.t === 'vote' && st.goAt && !st.result) {
           const v = String(d.v || '');
           if (v !== cid && st.ids.indexOf(v) >= 0) st.votes.set(cid, v);
-          if (st.ids.every(id => id === st.imp || st.votes.has(id))) resolve(room);
+          advance(room);
+          if (!st.result && st.ids.every(id => id === st.imp || st.votes.has(id))) resolve(room);
         }
         if (d.t === 'close' && st.goAt && !st.result && cid === room.leader) resolve(room);
         if (d.t === 'again' && st.result && !room.next && (cid === room.leader || now - st.result.at > 120000)) {
