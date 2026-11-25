@@ -278,7 +278,7 @@ http.createServer((req, res) => {
     req.on('data', c => { body += c; if (body.length > 60000) req.destroy(); });
     req.on('end', () => {
       let d; try { d = JSON.parse(body); } catch (e) { return send(res, 400, 'bad json'); }
-      if (!d || ['signup', 'login', 'get', 'add', 'buy', 'chpw', 'prof'].indexOf(d.t) < 0) return send(res, 400, 'bad msg');
+      if (!d || ['signup', 'login', 'get', 'add', 'buy', 'chpw', 'prof', 'solo'].indexOf(d.t) < 0) return send(res, 400, 'bad msg');
       d._ip = ip; accHandle(d).then(r => send(res, r[0], typeof r[1] === 'string' ? r[1] : JSON.stringify(r[1]), typeof r[1] === 'string' ? {} : { 'Content-Type': 'application/json' }))
         .catch(e => { console.log('acc error', e.message); send(res, 500, 'خطأ في السيرفر'); });
     });
