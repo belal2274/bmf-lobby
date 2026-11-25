@@ -74,7 +74,8 @@ function advance(room) {
   };
   for (let g = 0; g < 50 && now >= tk.u; g++) {
     if (tk.ph === 'ask') { if (tk.t) { tk.ph = 'ans'; tk.u = now + RULES.ans * 1000; } else nextTurn(); }
-    else if (tk.ph === 'ans') nextTurn();
+    else if (tk.ph === 'ans') { tk.ph = 'gap'; tk.u = now + RULES.gap * 1000; } // pause between questions: the only time sounds are allowed
+    else if (tk.ph === 'gap') nextTurn();
     else { tk.cyc++; tk.i = 0; tk.ph = 'ask'; tk.a = ord[0]; tk.t = null; tk.dn = null; tk.u = now + RULES.ask * 1000; }
   }
 }
@@ -113,7 +114,7 @@ function send(res, code, body, extra) {
 const CATALOG = (() => { try { return JSON.parse(require('fs').readFileSync(require('path').join(__dirname, 'catalog.json'), 'utf8')); } catch (e) { console.log('catalog.json missing', e.message); return { stickers: [], sounds: [], frames: [] }; } })();
 const PRICES = new Map();
 for (const k of ['stickers', 'sounds', 'frames']) for (const x of CATALOG[k]) PRICES.set(x.id, x.price | 0);
-const RULES = Object.assign({ reveal: 10, ask: 60, ans: 60, disc: 300, cap: 3600, dur_min: 1, dur_max: 60 }, CATALOG.rules || {});
+const RULES = Object.assign({ reveal: 10, ask: 60, ans: 60, gap: 12, sound_cd: 30, sticker_cd: 10, disc: 300, cap: 3600, dur_min: 1, dur_max: 60 }, CATALOG.rules || {});
 const itemPrice = id => PRICES.get(String(id)) || 0;
 const ADULT = new Set((CATALOG.stickers || []).concat(CATALOG.sounds || []).filter(x => x.adult).map(x => x.id)); // regular edition only
 // ---- accounts (Supabase REST when SUPA_URL + SUPA_KEY are set, in-memory otherwise) ----
@@ -157,6 +158,7 @@ setInterval(() => { const n = Date.now(); for (const [k, v] of signups) if (n - 
 const sha = s => crypto.createHash('sha256').update(s).digest('hex');
 const loginFails = new Map();
 setInterval(() => { const n = Date.now(); for (const [k, v] of loginFails) if (n - v.t > 600000) loginFails.delete(k); }, 300000).unref();
+const soloTix = new Map(); // one-time tickets for the owner's solo test rooms
 const accQ = new Map(); // serialize per user so two phones cannot race
 function accLock(u, fn) {
   const prev = accQ.get(u) || Promise.resolve();
@@ -199,6 +201,12 @@ async function accHandle(d) {
       return [200, { tok, pts: a.pts, items: a.items || '', prof: a.profile || '' }];
     }
     if (!a || a.tok !== sha(String(d.tok || ''))) return [403, 'سجل دخول تاني'];
+    if (t === 'solo') { // only the account 'belal', proven by its login token, gets a ticket
+      if (u !== 'belal') return [403, 'no'];
+      const tk = crypto.randomBytes(12).toString('hex'); soloTix.set(tk, Date.now() + 120000);
+      for (const [k, v] of soloTix) if (v < Date.now()) soloTix.delete(k);
+      return [200, { tk }];
+    }
     if (t === 'chpw') {
       const f = loginFails.get(u) || { n: 0, t: 0 };
       if (f.n >= 8 && Date.now() - f.t < 600000) return [429, 'محاولات كتير، استنى 10 دقايق'];
@@ -368,7 +376,8 @@ http.createServer((req, res) => {
       let room = rooms.get(code);
       if (!room) {
         const n = +code[1];
-        if (!d.host || d.t !== 'j' || n < 2 || n > 9) return send(res, 404, 'no room');
+        if (!d.host || d.t !== 'j' || n < 1 || n > 9) return send(res, 404, 'no room');
+        if (n === 1) { const ex = soloTix.get(String(d.solo || '')); soloTix.delete(String(d.solo || '')); if (!ex || ex < Date.now()) return send(res, 403, 'no solo'); }
         if (rooms.size >= MAX_ROOMS || limited('new:' + ip, 20)) return send(res, 429, 'busy');
         const rr = Math.floor(+d.rounds), rounds = Number.isFinite(rr) ? Math.max(1, Math.min(20, rr)) : 3;
         const dd0 = Math.floor(+d.dur), dur0 = Number.isFinite(dd0) ? Math.max(RULES.dur_min * 60, Math.min(RULES.dur_max * 60, dd0)) : 180;
@@ -390,9 +399,12 @@ http.createServer((req, res) => {
           const id = String(d.k || '');
           if (!st.goAt || !/^[sa]/.test(id) || !itemPrice(id)) return send(res, 400, 'bad fx');
           if (ADULT.has(id) && room.fam && room.fam.has(cid)) return send(res, 400, 'bad fx');
-          st.fxT = st.fxT || new Map(); st.fx = st.fx || []; st.fxs = st.fxs || 0;
-          if (now - (st.fxT.get(cid) || 0) < 3000) return send(res, 429, 'wait');
-          st.fxT.set(cid, now); st.fxs++;
+          st.fx = st.fx || []; st.fxs = st.fxs || 0;
+          const snd = id.charAt(0) === 'a';
+          if (snd && room.vm === 'game' && !(st.tk && st.tk.ph === 'gap')) return send(res, 409, 'no sound now'); // sounds only in the pause between questions
+          room.fxT = room.fxT || {}; const fk = cid + (snd ? ':a' : ':s');
+          if (now - (room.fxT[fk] || 0) < (snd ? RULES.sound_cd : RULES.sticker_cd) * 1000) return send(res, 429, 'wait');
+          room.fxT[fk] = now; st.fxs++;
           st.fx.push({ i: st.fxs, f: cid, k: id, t: now });
           st.fx = st.fx.filter(e => now - e.t < 30000).slice(-30);
           return send(res, 200, JSON.stringify(stateOf(room, cid, d.s)), J);
