@@ -77,6 +77,10 @@
   {
    "id": "a3",
    "price": 5
+  },
+  {
+   "id": "a4",
+   "price": 5
   }
  ],
  "frames": [
@@ -179,6 +183,7 @@
   "idle_skip": true,
   "reveal": 10,
   "posters": true,
-  "photos": true
+  "photos": true,
+  "unlock_all": true
  }
 }
