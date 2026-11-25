@@ -130,7 +130,22 @@ async function accGet(u) {
 async function accPut(row, create) {
   if (!SUPA_URL) { memAcc.set(row.username, Object.assign({}, row)); return; }
   if (create) await dbFetch('accounts', { method: 'POST', body: JSON.stringify(row) });
-  else await dbFetch('accounts?username=eq.' + encodeURIComponent(row.username), { method: 'PATCH', body: JSON.stringify({ salt: row.salt, hash: row.hash, tok: row.tok, pts: row.pts, rids: row.rids, items: row.items || '' }) });
+  else await dbFetch('accounts?username=eq.' + encodeURIComponent(row.username), { method: 'PATCH', body: JSON.stringify({ salt: row.salt, hash: row.hash, tok: row.tok, pts: row.pts, rids: row.rids, items: row.items || '', profile: row.profile || '' }) });
+}
+// profile (display name, avatar, photo, frame, font) lives on the account so it follows the user to every device
+const PROF_STR = { n: 14, a: 12, g: 12, r: 6, f: 8, t: 6000, p: 40000 };
+function cleanProf(raw) {
+  let o; try { o = JSON.parse(String(raw || '')); } catch (e) { return null; }
+  if (!o || typeof o !== 'object' || Array.isArray(o)) return null;
+  const out = {};
+  for (const k of Object.keys(PROF_STR)) {
+    const v = o[k]; if (v === undefined || v === null || v === '') continue;
+    if (typeof v !== 'string' || v.length > PROF_STR[k]) return null;
+    if ((k === 't' || k === 'p') && !/^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+\/=]+$/.test(v)) return null;
+    out[k] = v;
+  }
+  if (!out.n) return null;
+  return JSON.stringify(out);
 }
 const signups = new Map();
 function signupLimited(ip) { if (/^(::1|127\.0\.0\.1|::ffff:127\.0\.0\.1)$/.test(ip)) return false; const n = Date.now(), h = signups.get(ip); if (!h || n - h.t > 3600e3) { signups.set(ip, { n: 1, t: n }); return false; } return ++h.n > 6; }
@@ -157,9 +172,9 @@ async function accHandle(d) {
       const salt = crypto.randomBytes(16).toString('hex'), hash = crypto.scryptSync(p, salt, 32).toString('hex');
       const tok = crypto.randomBytes(24).toString('hex');
       const its = String(d.items || '').split(',').filter((x, i, a) => itemPrice(x) > 0 && a.indexOf(x) === i).join(',');
-      let pts = Math.floor(+d.init) || 0; pts = Math.max(0, Math.min(40, pts));
-      await accPut({ username: u, salt, hash, tok: sha(tok), pts, rids: [], items: its }, true);
-      return [200, { tok, pts, items: its }];
+      let pts = Math.floor(+d.init) || 0; pts = Math.max(0, Math.min(1000, pts));
+      await accPut({ username: u, salt, hash, tok: sha(tok), pts, rids: [], items: its, profile: cleanProf(d.prof) || '' }, true);
+      return [200, { tok, pts, items: its, prof: cleanProf(d.prof) || '' }];
     }
     const a = await accGet(u);
     if (t === 'login') {
@@ -170,8 +185,14 @@ async function accHandle(d) {
       if (!crypto.timingSafeEqual(Buffer.from(h), Buffer.from(a.hash))) { loginFails.set(u, { n: (f.n >= 8 && Date.now() - f.t >= 600000 ? 0 : f.n) + 1, t: Date.now() }); return [403, 'الاسم أو كلمة السر غلط']; }
       loginFails.delete(u);
       const tok = crypto.randomBytes(24).toString('hex');
+      // guest points carried from the device: added once per guest id, never twice
+      const gid = String(d.gid || ''), gp = Math.floor(+d.g) || 0;
+      if (gp > 0 && /^[A-Za-z0-9]{6,40}$/.test(gid)) {
+        const key = 'g' + gid; if (!Array.isArray(a.rids)) a.rids = [];
+        if (a.rids.indexOf(key) < 0) { a.pts += Math.min(gp, 1000); a.rids.push(key); }
+      }
       a.tok = sha(tok); await accPut(a, false);
-      return [200, { tok, pts: a.pts, items: a.items || '' }];
+      return [200, { tok, pts: a.pts, items: a.items || '', prof: a.profile || '' }];
     }
     if (!a || a.tok !== sha(String(d.tok || ''))) return [403, 'سجل دخول تاني'];
     if (t === 'chpw') {
@@ -186,7 +207,13 @@ async function accHandle(d) {
       await accPut(a, false);
       return [200, { ok: 1 }];
     }
-    if (t === 'get') return [200, { pts: a.pts, items: a.items || '' }];
+    if (t === 'get') return [200, { pts: a.pts, items: a.items || '', prof: a.profile || '' }];
+    if (t === 'prof') {
+      const pr = cleanProf(d.prof);
+      if (!pr) return [400, 'بروفايل غير صالح'];
+      a.profile = pr; await accPut(a, false);
+      return [200, { ok: 1, prof: pr }];
+    }
     if (t === 'buy') {
       const id = String(d.item || ''), price = itemPrice(id), own = String(a.items || '').split(',').filter(Boolean);
       if (!price) return [400, 'الحاجة دي مش موجودة'];
@@ -236,10 +263,10 @@ http.createServer((req, res) => {
     if (req.method !== 'POST') return send(res, 405, 'method');
     if (limited('acc:' + ip, 60)) return send(res, 429, 'slow down');
     let body = '';
-    req.on('data', c => { body += c; if (body.length > 2000) req.destroy(); });
+    req.on('data', c => { body += c; if (body.length > 60000) req.destroy(); });
     req.on('end', () => {
       let d; try { d = JSON.parse(body); } catch (e) { return send(res, 400, 'bad json'); }
-      if (!d || ['signup', 'login', 'get', 'add', 'buy', 'chpw'].indexOf(d.t) < 0) return send(res, 400, 'bad msg');
+      if (!d || ['signup', 'login', 'get', 'add', 'buy', 'chpw', 'prof'].indexOf(d.t) < 0) return send(res, 400, 'bad msg');
       d._ip = ip; accHandle(d).then(r => send(res, r[0], typeof r[1] === 'string' ? r[1] : JSON.stringify(r[1]), typeof r[1] === 'string' ? {} : { 'Content-Type': 'application/json' }))
         .catch(e => { console.log('acc error', e.message); send(res, 500, 'خطأ في السيرفر'); });
     });
