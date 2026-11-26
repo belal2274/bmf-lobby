@@ -79,31 +79,52 @@ function advance(room) {
   if (st.ids.length === 2 && room.vm !== 'game' && now - st.goAt > ((room.dur || 180) + G2_GRACE) * 1000) { resolveFinal(room); return; }
   // a player who left (no contact for ABSENT_MS) keeps their seat but is not waited for when voting
   if (st.votes.size > 0 && st.ids.every(id => id === st.imp || st.votes.has(id) || now - ((st.pres && st.pres[id]) || st.goAt) > ABSENT_MS)) { resolve(room); return; }
-  if (room.vm !== 'game') return;
   const ord = st.ids;
+  if (room.vm !== 'game' && ord.length === 2) return;
   let tk = st.tk;
-  if (!tk) tk = st.tk = { ph: 'ask', i: 0, a: ord[0], t: null, u: st.goAt + RULES.ask * 1000, cyc: 1 };
-  const nextTurn = () => {
-    tk.i++; tk.t = null;
-    if (tk.i >= ord.length) { tk.ph = 'disc'; tk.a = null; tk.dn = new Set(); tk.u = now + RULES.disc * 1000; }
-    else { tk.ph = 'ask'; tk.a = ord[tk.i]; tk.u = now + RULES.ask * 1000; }
+  if (!tk) tk = st.tk = { ph: 'ask', a: ord.length === 2 ? st.imp : ord[0], t: null, u: st.goAt + RULES.ask * 1000, nq: 0, cyc: 1, as: [], st: ord[0] };
+  if (tk.ph === 'done') return;
+  // question cycles: in a cycle every player asks once. The asker picks freely among players who have not asked yet this cycle; the last asker must ask the cycle starter.
+  // The asked player asks next. After Q_ROUNDS cycles (3+ players) the questions end and voting opens.
+  const nextTurn = (viaAnswer) => {
+    if (ord.length === 2) { tk.a = st.imp; tk.t = null; tk.ph = 'ask'; tk.u = now + RULES.ask * 1000; return; } // 2 players: the impostor keeps asking the other player, no cycles and no cap
+    if (tk.a && tk.as.indexOf(tk.a) < 0) tk.as.push(tk.a);
+    let n = viaAnswer && tk.t && ord.indexOf(tk.t) >= 0 ? tk.t : null;
+    if (tk.as.length >= ord.length) {
+      tk.cyc++; tk.as = [];
+      if (tk.cyc > Q_ROUNDS && ord.length >= 3) { tk.ph = 'done'; tk.a = null; tk.t = null; tk.u = now + 30 * 86400000; st.vopen = true; return; }
+      if (n === null) n = ord[0];
+      tk.st = n;
+    } else if (n === null || tk.as.indexOf(n) >= 0) n = ord.find(o => tk.as.indexOf(o) < 0) || ord[0];
+    tk.a = n; tk.t = null; tk.ph = 'ask'; tk.u = now + RULES.ask * 1000;
   };
   for (let g = 0; g < 50 && now >= tk.u; g++) {
-    if (tk.ph === 'ask') { if (tk.t) { tk.ph = 'ans'; tk.u = now + RULES.ans * 1000; } else nextTurn(); }
-    else if (tk.ph === 'ans') { tk.ph = 'gap'; tk.u = now + RULES.gap * 1000; } // pause between questions: the only time sounds are allowed
-    else if (tk.ph === 'gap') nextTurn();
-    else { tk.cyc++; tk.i = 0; tk.ph = 'ask'; tk.a = ord[0]; tk.t = null; tk.dn = null; tk.u = now + RULES.ask * 1000; }
+    if (tk.ph === 'ask') { if (tk.t) { tk.ph = 'ans'; tk.u = now + RULES.ans * 1000; } else nextTurn(false); }
+    else if (tk.ph === 'ans') { tk.nq++; if (room.vm === 'game') { tk.ph = 'gap'; tk.u = now + RULES.gap * 1000; } else nextTurn(true); } // in-game voice: short pause between questions is the only time sounds are allowed
+    else nextTurn(true);
   }
+}
+const Q_ROUNDS = 3;
+function candFor(st, tk, a) {
+  const ord = st.ids, left = ord.filter(o => o !== a && tk.as.indexOf(o) < 0);
+  if (left.length) return left;
+  return tk.st && tk.st !== a ? [tk.st] : ord.filter(o => o !== a);
+}
+function voteOpen(st) {
+  if (st.ids.length < 3) return true;
+  if (st.vopen) return true;
+  const now = Date.now(), rv = st.rv || new Set();
+  if (st.ids.every(id => rv.has(id) || now - ((st.pres && st.pres[id]) || st.goAt) > ABSENT_MS)) { st.vopen = true; return true; }
+  return false;
 }
 function talkAct(room, cid, d) {
   advance(room);
   const st = room.started, tk = st && st.tk, now = Date.now();
-  if (!tk || st.result || room.vm !== 'game') return;
-  if (d.t === 'ask' && tk.ph === 'ask' && tk.a === cid) { const v = String(d.v || ''); if (v !== cid && st.ids.indexOf(v) >= 0) tk.t = v; }
+  if (!tk || st.result) return;
+  if (d.t === 'ask' && tk.ph === 'ask' && tk.a === cid) { const v = String(d.v || ''); if (v !== cid && candFor(st, tk, cid).indexOf(v) >= 0) tk.t = v; }
   if (d.t === 'tdone') {
     if (tk.ph === 'ask' && tk.a === cid && tk.t) { tk.ph = 'ans'; tk.u = now + RULES.ans * 1000; }
     else if (tk.ph === 'ans' && tk.t === cid) tk.u = now;
-    else if (tk.ph === 'disc') { tk.dn = tk.dn || new Set(); tk.dn.add(cid); if (st.ids.every(x => tk.dn.has(x))) tk.u = now; }
     else if (tk.ph === 'ask' && tk.a === cid && !tk.t) tk.u = now;
     advance(room);
   }
@@ -113,7 +134,7 @@ function stateOf(room, cid, since) {
   const st = room.started, now = Date.now();
   return { k: st.seen.size, n: st.ids.length, el: st.goAt ? now - st.goAt : null, nx: room.next || null,
     rd: st.ready.size, rm: st.ready.has(cid), ca: st.startAt ? st.startAt - now : null, sn: st.seen.has(cid),
-    g2: { opts: (st.g2 && st.g2.opts) || null, gw: st.gwait ? Math.max(0, st.gwait + G3_GRACE * 1000 - now) : null }, vt: st.votes.size, mine: st.votes.get(cid) || null, round: room.round, rounds: room.rounds, dur: room.dur || 180, vm: room.vm || 'ext', rv: st.revealAt && !st.goAt ? Math.max(0, st.revealAt - now) : null, tk: st.tk && !st.result ? { ph: st.tk.ph, a: st.tk.a, t: st.tk.t, u: Math.max(0, st.tk.u - now), cyc: st.tk.cyc, dn: st.tk.ph === 'disc' && st.tk.dn ? st.tk.dn.size : 0, dm: !!(st.tk.ph === 'disc' && st.tk.dn && st.tk.dn.has(cid)) } : null, lead: room.leader, res: st.result, fx: (st.fx || []).filter(e => e.i > (+since || 0) && !(ADULT.has(e.k) && room.fam && room.fam.has(cid))), fxs: st.fxs || 0 };
+    g2: { opts: (st.g2 && st.g2.opts) || null, gw: st.gwait ? Math.max(0, st.gwait + G3_GRACE * 1000 - now) : null }, vt: st.votes.size, mine: st.votes.get(cid) || null, round: room.round, rounds: room.rounds, dur: room.dur || 180, vm: room.vm || 'ext', rv: st.revealAt && !st.goAt ? Math.max(0, st.revealAt - now) : null, tk: st.tk && !st.result ? { ph: st.tk.ph, a: st.tk.a, t: st.tk.t, u: st.tk.ph === 'done' ? 0 : Math.max(0, st.tk.u - now), nq: st.tk.nq || 0, cyc: st.tk.cyc, cd: st.tk.ph === 'ask' && st.tk.a === cid ? candFor(st, st.tk, cid) : null } : null, qr: st.rv ? st.rv.size : 0, qm: !!(st.rv && st.rv.has(cid)), qa: voteOpen(st), lead: room.leader, res: st.result, fx: (st.fx || []).filter(e => e.i > (+since || 0) && !(ADULT.has(e.k) && room.fam && room.fam.has(cid))), fxs: st.fxs || 0 };
 }
 function sendRole(room, cl) {
   const st = room.started;
@@ -387,7 +408,7 @@ http.createServer((req, res) => {
     req.on('end', () => {
       let d;
       try { d = JSON.parse(body); } catch (e) { return send(res, 400, 'bad json'); }
-      const TYPES = ['j', 'l', 'reveal', 'seen', 'state', 'again', 'ready', 'vote', 'close', 'vjoin', 'vleave', 'sig', 'sigpoll', 'fx', 'ask', 'tdone', 'opts', 'pick'];
+      const TYPES = ['j', 'l', 'reveal', 'seen', 'state', 'again', 'ready', 'vote', 'close', 'vjoin', 'vleave', 'sig', 'sigpoll', 'fx', 'ask', 'tdone', 'opts', 'pick', 'qrdy'];
       if (!d || TYPES.indexOf(d.t) < 0 || typeof d.c !== 'string' || !/^[A-Za-z0-9_-]{1,20}$/.test(d.c)) return send(res, 400, 'bad msg');
       let room = rooms.get(code);
       if (!room) {
@@ -406,11 +427,12 @@ http.createServer((req, res) => {
       const J = { 'Content-Type': 'application/json' };
       const st = room.started;
       if (st && st.ids.indexOf(cid) >= 0) { st.pres = st.pres || {}; st.pres[cid] = Date.now(); }
-      if (['reveal', 'seen', 'state', 'again', 'ready', 'vote', 'close', 'vjoin', 'vleave', 'sig', 'sigpoll', 'fx', 'ask', 'tdone', 'opts', 'pick'].indexOf(d.t) >= 0) {
+      if (['reveal', 'seen', 'state', 'again', 'ready', 'vote', 'close', 'vjoin', 'vleave', 'sig', 'sigpoll', 'fx', 'ask', 'tdone', 'opts', 'pick', 'qrdy'].indexOf(d.t) >= 0) {
         if (!st || st.ids.indexOf(cid) < 0) return send(res, 403, 'no');
         const now = Date.now();
         advance(room);
         if (d.t === 'ask' || d.t === 'tdone') { talkAct(room, cid, d); return send(res, 200, JSON.stringify(stateOf(room, cid, d.s)), J); }
+        if (d.t === 'qrdy') { if (st.goAt && !st.result && st.ids.length >= 3 && !st.vopen) { st.rv = st.rv || new Set(); if (d.v) st.rv.add(cid); else st.rv.delete(cid); voteOpen(st); } return send(res, 200, JSON.stringify(stateOf(room, cid, d.s)), J); }
         if (d.t === 'fx') {
           const id = String(d.k || '');
           if (!st.goAt || !/^[sa]/.test(id) || !itemPrice(id)) return send(res, 400, 'bad fx');
@@ -460,7 +482,7 @@ http.createServer((req, res) => {
             if (Number.isFinite(i) && i >= 0 && i < g.opts.length) { g.pick = i; g.ok = i === g.k; resolveFinal(room); }
           }
         }
-        if (d.t === 'vote' && st.goAt && !st.result && !st.gwait && st.ids.length !== 2) {
+        if (d.t === 'vote' && st.goAt && !st.result && !st.gwait && st.ids.length !== 2 && voteOpen(st)) {
           const v = String(d.v || '');
           if (v !== cid && st.ids.indexOf(v) >= 0) st.votes.set(cid, v);
           advance(room);
