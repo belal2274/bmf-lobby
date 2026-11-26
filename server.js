@@ -80,29 +80,31 @@ function advance(room) {
   // a player who left (no contact for ABSENT_MS) keeps their seat but is not waited for when voting
   if (st.votes.size > 0 && st.ids.every(id => id === st.imp || st.votes.has(id) || now - ((st.pres && st.pres[id]) || st.goAt) > ABSENT_MS)) { resolve(room); return; }
   const ord = st.ids;
-  if (room.vm !== 'game' && ord.length === 2) return;
+  if (room.vm !== 'game') return; // external call: no question system at all
   let tk = st.tk;
   if (!tk) tk = st.tk = { ph: 'ask', a: ord.length === 2 ? st.imp : ord[0], t: null, u: st.goAt + RULES.ask * 1000, nq: 0, cyc: 1, as: [], st: ord[0] };
   if (tk.ph === 'done') return;
   // question cycles: in a cycle every player asks once. The asker picks freely among players who have not asked yet this cycle; the last asker must ask the cycle starter.
   // The asked player asks next. After Q_ROUNDS cycles (3+ players) the questions end and voting opens.
-  const nextTurn = (viaAnswer) => {
-    if (ord.length === 2) { tk.a = st.imp; tk.t = null; tk.ph = 'ask'; tk.u = now + RULES.ask * 1000; return; } // 2 players: the impostor keeps asking the other player, no cycles and no cap
-    if (tk.a && tk.as.indexOf(tk.a) < 0) tk.as.push(tk.a);
-    let n = viaAnswer && tk.t && ord.indexOf(tk.t) >= 0 ? tk.t : null;
-    if (tk.as.length >= ord.length) {
-      tk.cyc++; tk.as = [];
-      if (tk.cyc > Q_ROUNDS && ord.length >= 3) { tk.ph = 'done'; tk.a = null; tk.t = null; tk.u = now + 30 * 86400000; st.vopen = true; return; }
-      if (n === null) n = ord[0];
-      tk.st = n;
-    } else if (n === null || tk.as.indexOf(n) >= 0) n = ord.find(o => tk.as.indexOf(o) < 0) || ord[0];
-    tk.a = n; tk.t = null; tk.ph = 'ask'; tk.u = now + RULES.ask * 1000;
-  };
-  for (let g = 0; g < 50 && now >= tk.u; g++) {
-    if (tk.ph === 'ask') { if (tk.t) { tk.ph = 'ans'; tk.u = now + RULES.ans * 1000; } else nextTurn(false); }
-    else if (tk.ph === 'ans') { tk.nq++; if (room.vm === 'game') { tk.ph = 'gap'; tk.u = now + RULES.gap * 1000; } else nextTurn(true); } // in-game voice: short pause between questions is the only time sounds are allowed
-    else nextTurn(true);
-  }
+  if (ord.length >= 3) voteOpen(st);
+  if (st.vopen && tk.ph !== 'done') { tk.ph = 'done'; tk.a = null; tk.t = null; tk.pv = null; tk.u = now + 30 * 86400000; return; } // voting is open: the questions are over
+  for (let g = 0; g < 50 && now >= tk.u; g++) nextTurn(st, tk, false, now); // asker did not pick in time: the turn passes without a question
+}
+// question cycles: in a cycle every player asks once. The asker picks freely among players who have not asked yet this cycle; the last asker must ask the cycle starter.
+// Picking is the whole turn: the asked player becomes the asker at once. After Q_ROUNDS cycles (3+ players) the questions end and voting opens.
+function nextTurn(st, tk, viaAnswer, now) {
+  const ord = st.ids;
+  tk.pv = viaAnswer ? tk.a : null;
+  if (ord.length === 2) { tk.a = st.imp; tk.t = null; tk.ph = 'ask'; tk.u = now + RULES.ask * 1000; return; } // 2 players: the impostor keeps asking the other player, no cycles and no cap
+  if (tk.a && tk.as.indexOf(tk.a) < 0) tk.as.push(tk.a);
+  let n = viaAnswer && tk.t && ord.indexOf(tk.t) >= 0 ? tk.t : null;
+  if (tk.as.length >= ord.length) {
+    tk.cyc++; tk.as = [];
+    if (tk.cyc > Q_ROUNDS && ord.length >= 3) { tk.ph = 'done'; tk.a = null; tk.t = null; tk.pv = null; tk.u = now + 30 * 86400000; st.vopen = true; return; }
+    if (n === null) n = ord[0];
+    tk.st = n;
+  } else if (n === null || tk.as.indexOf(n) >= 0) n = ord.find(o => tk.as.indexOf(o) < 0) || ord[0];
+  tk.a = n; tk.t = null; tk.ph = 'ask'; tk.u = now + RULES.ask * 1000;
 }
 const Q_ROUNDS = 3;
 function candFor(st, tk, a) {
@@ -120,21 +122,15 @@ function voteOpen(st) {
 function talkAct(room, cid, d) {
   advance(room);
   const st = room.started, tk = st && st.tk, now = Date.now();
-  if (!tk || st.result) return;
-  if (d.t === 'ask' && tk.ph === 'ask' && tk.a === cid) { const v = String(d.v || ''); if (v !== cid && candFor(st, tk, cid).indexOf(v) >= 0) tk.t = v; }
-  if (d.t === 'tdone') {
-    if (tk.ph === 'ask' && tk.a === cid && tk.t) { tk.ph = 'ans'; tk.u = now + RULES.ans * 1000; }
-    else if (tk.ph === 'ans' && tk.t === cid) tk.u = now;
-    else if (tk.ph === 'ask' && tk.a === cid && !tk.t) tk.u = now;
-    advance(room);
-  }
+  if (!tk || st.result || st.gwait || tk.ph !== 'ask' || room.vm !== 'game') return;
+  if (d.t === 'ask' && tk.a === cid) { const v = String(d.v || ''); if (v !== cid && candFor(st, tk, cid).indexOf(v) >= 0) { tk.t = v; tk.nq++; nextTurn(st, tk, true, now); } }
 }
 function stateOf(room, cid, since) {
   advance(room);
   const st = room.started, now = Date.now();
   return { k: st.seen.size, n: st.ids.length, el: st.goAt ? now - st.goAt : null, nx: room.next || null,
     rd: st.ready.size, rm: st.ready.has(cid), ca: st.startAt ? st.startAt - now : null, sn: st.seen.has(cid),
-    g2: { opts: (st.g2 && st.g2.opts) || null, gw: st.gwait ? Math.max(0, st.gwait + G3_GRACE * 1000 - now) : null }, vt: st.votes.size, mine: st.votes.get(cid) || null, round: room.round, rounds: room.rounds, dur: room.dur || 180, vm: room.vm || 'ext', rv: st.revealAt && !st.goAt ? Math.max(0, st.revealAt - now) : null, tk: st.tk && !st.result ? { ph: st.tk.ph, a: st.tk.a, t: st.tk.t, u: st.tk.ph === 'done' ? 0 : Math.max(0, st.tk.u - now), nq: st.tk.nq || 0, cyc: st.tk.cyc, cd: st.tk.ph === 'ask' && st.tk.a === cid ? candFor(st, st.tk, cid) : null } : null, qr: st.rv ? st.rv.size : 0, qm: !!(st.rv && st.rv.has(cid)), qa: voteOpen(st), lead: room.leader, res: st.result, fx: (st.fx || []).filter(e => e.i > (+since || 0) && !(ADULT.has(e.k) && room.fam && room.fam.has(cid))), fxs: st.fxs || 0 };
+    g2: { opts: (st.g2 && st.g2.opts) || null, gw: st.gwait ? Math.max(0, st.gwait + G3_GRACE * 1000 - now) : null }, vt: st.votes.size, mine: st.votes.get(cid) || null, round: room.round, rounds: room.rounds, dur: room.dur || 180, vm: room.vm || 'ext', rv: st.revealAt && !st.goAt ? Math.max(0, st.revealAt - now) : null, tk: st.tk && !st.result ? { ph: st.tk.ph, a: st.tk.a, t: st.tk.t, u: st.tk.ph === 'done' ? 0 : Math.max(0, st.tk.u - now), nq: st.tk.nq || 0, cyc: st.tk.cyc, pv: st.tk.pv || null, cd: st.tk.ph === 'ask' && st.tk.a === cid ? candFor(st, st.tk, cid) : null } : null, qr: st.rv ? st.rv.size : 0, qm: !!(st.rv && st.rv.has(cid)), qa: voteOpen(st), lead: room.leader, res: st.result, fx: (st.fx || []).filter(e => e.i > (+since || 0) && !(ADULT.has(e.k) && room.fam && room.fam.has(cid))), fxs: st.fxs || 0 };
 }
 function sendRole(room, cl) {
   const st = room.started;
